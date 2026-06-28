@@ -1,55 +1,21 @@
 """
-Cervix Visual AI - pipeline melhorado em arquivo único.
+Cervix Visual AI - pipeline em arquivo único.
 
 Objetivo:
-    Pipeline completo de Computer Vision para imagens visuais do colo uterino
-    do IARC Cervical Image Bank.
+    Pipeline completo de Computer Vision para imagens visuais do colo uterino com o uso de Ácido Acético (VIA), utilizando o conjunto de dados do IARC Cervical Image Bank.
 
 Escopo científico:
-    Imagens pós-ácido acético. Diferenciação binária:
+    Imagens pós-ácido acético. 
+    Diferenciação binária:
         - negative_or_low_grade
         - high_grade_or_cancer
     Resultados experimentais. Não usar para decisão clínica.
-
-MELHORIAS vs. VERSÃO ANTERIOR
-=================================
-Bugs corrigidos:
-  - epochs_without_improvement += 1  (era += 0 — early stopping nunca disparava)
-  - Removido import incorreto `from pyexpat import model`
-  - best_model_auc separado da variável de plot
-
-Performance (+5–15% AUC esperado):
-  - Arquitetura: EfficientNet-B3 como padrão (vs ResNet34)
-  - Cabeça classificadora 2 camadas: Dropout→Linear(256)→ReLU→Dropout→Linear(1)
-  - Augmentação mais forte: RandomErasing, GaussianBlur, RandomVerticalFlip,
-    ColorJitter ampliado, RandomCrop após resize oversampled
-  - TTA 4 vistas: orig + hflip + vflip + hvflip  (era 2 vistas)
-  - Mixup (alpha=0.4): melhora calibração e generalização
-  - Gradient clipping (max_norm=1.0): estabilidade numérica
-  - CosineAnnealingWarmRestarts: escapa de mínimos locais melhor que ReduceLROnPlateau
-  - Freeze 5 épocas (era 3): head tem mais tempo de adaptar antes do fine-tuning
-  - Dropout 0.40 (era 0.30), weight_decay 0.01 (era 0.001)
-
-Visualizações novas:
-  - Curva de calibração (reliability diagram)
-  - Threshold sweep (F1, Sensibilidade, Especificidade vs threshold)
-  - Painel GradCAM 2×2: um exemplar por tipo (TP, TN, FP, FN)
-  - GradCAM suporte EfficientNet-B3
-
-Uso:
-    python cervix_visual_ai_arquivo_unico.py prepare
-    python cervix_visual_ai_arquivo_unico.py train
-    python cervix_visual_ai_arquivo_unico.py evaluate
-    python cervix_visual_ai_arquivo_unico.py predict --image <caminho>
 """
 
 from __future__ import annotations
-
 import argparse
 import copy
-import importlib
 import json
-import os
 import random
 import re
 import sys
@@ -64,9 +30,9 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from PIL import Image
 from sklearn.calibration import calibration_curve as sk_calibration_curve
 from sklearn.metrics import (
@@ -99,14 +65,6 @@ DEFAULT_DATA_DIR = SCRIPT_DIR / "data" / "iarc"
 DEFAULT_MANIFEST = DEFAULT_DATA_DIR / "manifest.csv"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs" / "arquivo_unico"
 DEFAULT_CHECKPOINT = DEFAULT_OUTPUT_DIR / "best_model.pt"
-
-# Intel & MobileODT Cervical Cancer Screening (pré-treino de domínio)
-DEFAULT_INTEL_ZIP      = Path(r"C:\Users\ueldo\Desktop\INTEL CERVICAL.zip")
-DEFAULT_INTEL_DATA_DIR = SCRIPT_DIR / "data" / "intel"
-DEFAULT_INTEL_PRETRAIN = DEFAULT_OUTPUT_DIR / "pretrain_backbone.pt"
-INTEL_LABEL_TO_INDEX   = {"Type_1": 0, "Type_2": 1, "Type_3": 2}
-INTEL_N_CLASSES        = 3
-
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 IMAGE_TYPE = "After acetic acid"
 LABEL_TO_INDEX = {
@@ -122,68 +80,13 @@ HIGH_GRADE_TERMS = (
 # ---------------------------------------------------------------------------
 # Utilitários
 # ---------------------------------------------------------------------------
-
-# ── Exibição de imagens no terminal ────────────────────────────────────────
-#
-# Técnica: caractere Unicode U+2584 (▄ LOWER HALF BLOCK) com cores ANSI
-# 24-bit. Cada caractere representa 2 pixels na vertical:
-#   background = pixel superior   (ESC[48;2;R;G;Bm)
-#   foreground = pixel inferior   (ESC[38;2;R;G;Bm)
-#
-# Requisito: Windows Terminal, VS Code terminal, ou qualquer emulador com
-# suporte a cores "TrueColor" (ANSI 24-bit). Não funciona no CMD clássico.
-# ──────────────────────────────────────────────────────────────────────────
-
 _ANSI_RESET = "\033[0m"
-
-
-def _rgb_to_ansi256(r: int, g: int, b: int) -> int:
-    """Converte RGB para o índice mais próximo na paleta xterm-256."""
-    if r == g == b:
-        if r < 8:   return 16
-        if r > 248: return 231
-        return round((r - 8) / 247 * 24) + 232
-    return 16 + 36 * round(r / 255 * 5) + 6 * round(g / 255 * 5) + round(b / 255 * 5)
-
-
-def _has_truecolor() -> bool:
-    """Detecta suporte a ANSI 24-bit (TrueColor) no terminal atual."""
-    ct = os.environ.get("COLORTERM", "").lower()
-    if ct in ("truecolor", "24bit"):
-        return True
-    if "WT_SESSION" in os.environ:       # Windows Terminal
-        return True
-    if os.environ.get("TERM_PROGRAM") in ("vscode", "iterm.app", "hyper"):
-        return True
-    if sys.platform != "win32":
-        return True
-    return False
-
-
-def _pixel_escape(r1: int, g1: int, b1: int, r2: int, g2: int, b2: int,
-                  truecolor: bool) -> str:
-    """Retorna sequência ANSI para um par de pixels (superior=bg, inferior=fg)."""
-    if truecolor:
-        return (f"\033[48;2;{r1};{g1};{b1}m"
-                f"\033[38;2;{r2};{g2};{b2}m▄")
-    bg = _rgb_to_ansi256(r1, g1, b1)
-    fg = _rgb_to_ansi256(r2, g2, b2)
-    return f"\033[48;5;{bg}m\033[38;5;{fg}m▄"
-
 
 def show_image_terminal(
     image: str | Path | np.ndarray | "Image.Image",
     width: int = 80,
     title: str = "",
-) -> None:
-    """
-    Exibe uma imagem no terminal usando blocos Unicode coloridos.
-
-    Args:
-        image : caminho de arquivo, array NumPy (H×W×3 uint8) ou PIL Image.
-        width : largura em colunas de caracteres (padrão 80).
-        title : título opcional impresso acima da imagem.
-    """
+) -> None:    
     # --- carregamento ---
     if isinstance(image, (str, Path)):
         img = Image.open(image).convert("RGB")
@@ -210,14 +113,17 @@ def show_image_terminal(
         print(f"\n  \033[1m{title}\033[0m")
         print(sep)
 
-    tc = _has_truecolor()
     output_lines: list[str] = []
     for row in range(0, new_h - 1, 2):
         line_chars: list[str] = ["  "]
         for col in range(new_w):
             r1, g1, b1 = int(px[row,     col, 0]), int(px[row,     col, 1]), int(px[row,     col, 2])
             r2, g2, b2 = int(px[row + 1, col, 0]), int(px[row + 1, col, 1]), int(px[row + 1, col, 2])
-            line_chars.append(_pixel_escape(r1, g1, b1, r2, g2, b2, tc))
+            line_chars.append(
+                f"\033[48;2;{r1};{g1};{b1}m"   # bg = pixel superior
+                f"\033[38;2;{r2};{g2};{b2}m"   # fg = pixel inferior
+                "▄"
+            )
         line_chars.append(_ANSI_RESET)
         output_lines.append("".join(line_chars))
 
@@ -225,20 +131,12 @@ def show_image_terminal(
     if title:
         print(sep + "\n")
 
-
 def show_images_terminal(
     images: list,
     titles: list[str] | None = None,
     width_per_image: int = 38,
 ) -> None:
-    """
-    Exibe múltiplas imagens lado a lado no terminal.
 
-    Args:
-        images           : lista de imagens (mesmo formato de show_image_terminal).
-        titles           : títulos opcionais para cada imagem.
-        width_per_image  : largura em colunas para cada imagem (padrão 38).
-    """
     if not images:
         return
     titles = titles or [""] * len(images)
@@ -266,6 +164,7 @@ def show_images_terminal(
         scaled.append(np.array(img.resize((width_per_image, new_h), Image.LANCZOS)))
 
     max_rows = max(px.shape[0] for px in scaled)
+
     # imprime títulos
     header = "  "
     for t in titles:
@@ -274,7 +173,6 @@ def show_images_terminal(
 
     # imprime linhas de pixel lado a lado
     for row in range(0, max_rows - 1, 2):
-        tc = _has_truecolor()
         line = "  "
         for px in scaled:
             h = px.shape[0]
@@ -285,7 +183,10 @@ def show_images_terminal(
                 r2 = int(px[row + 1, col, 0]) if row + 1 < h else 0
                 g2 = int(px[row + 1, col, 1]) if row + 1 < h else 0
                 b2 = int(px[row + 1, col, 2]) if row + 1 < h else 0
-                line += _pixel_escape(r1, g1, b1, r2, g2, b2, tc)
+                line += (
+                    f"\033[48;2;{r1};{g1};{b1}m"
+                    f"\033[38;2;{r2};{g2};{b2}m▄"
+                )
             line += _ANSI_RESET + "  "
         print(line)
     print()
@@ -298,16 +199,7 @@ def show_gradcam_terminal(
     threshold: float = 0.5,
     width: int = 60,
 ) -> None:
-    """
-    Exibe original + overlay GradCAM lado a lado no terminal.
-
-    Args:
-        original  : imagem original (caminho, array ou PIL).
-        heatmap   : mapa de calor normalizado [0,1] com shape (H, W).
-        prob      : probabilidade de alto grau predita pelo modelo.
-        threshold : limiar de classificação.
-        width     : largura total (original + overlay) em colunas.
-    """
+   
     # --- prepara imagem original ---
     if isinstance(original, (str, Path)):
         orig_pil = Image.open(original).convert("RGB")
@@ -324,7 +216,6 @@ def show_gradcam_terminal(
     hm_u8 = (np.clip(hm_resized, 0, 1) * 255).astype(np.uint8)
     hm_color = cv2.cvtColor(cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
     overlay = cv2.addWeighted(orig_arr, 0.6, hm_color, 0.4, 0)
-
     label = "ALTO GRAU / CANCER" if prob >= threshold else "NEGATIVO / BAIXO GRAU"
     color_code = "\033[91m" if prob >= threshold else "\033[92m"  # vermelho / verde
     print(f"\n  {color_code}Predição: {label}  |  P(alto grau) = {prob:.3f}\033[0m")
@@ -342,15 +233,7 @@ def show_dataset_samples_terminal(
     n_per_class: int = 3,
     width_per_image: int = 28,
 ) -> None:
-    """
-    Mostra amostras aleatórias do dataset no terminal, agrupadas por classe.
-
-    Args:
-        manifest       : DataFrame com colunas image_path, label.
-        image_root     : diretório raiz das imagens.
-        n_per_class    : quantas imagens por classe (padrão 3).
-        width_per_image: largura de cada miniatura em colunas (padrão 28).
-    """
+   
     image_root = Path(image_root)
     for label in sorted(manifest["label"].unique()):
         subset = manifest[manifest["label"] == label]
@@ -362,7 +245,6 @@ def show_dataset_samples_terminal(
             titles=[Path(p).name[:width_per_image] for p in imgs],
             width_per_image=width_per_image,
         )
-
 
 def enable_windows_ansi() -> None:
     """Ativa suporte ANSI e UTF-8 no terminal Windows."""
@@ -419,9 +301,8 @@ def _json_default(v: Any) -> Any:
         return str(v)
     raise TypeError(f"Tipo não serializável: {type(v)!r}")
 
-
 # ---------------------------------------------------------------------------
-# Preparação do IARC (inalterado em relação à versão anterior)
+# Preparação do IARC Cervical Image Bank
 # ---------------------------------------------------------------------------
 
 def normalize_text(value: Any) -> str:
@@ -429,14 +310,11 @@ def normalize_text(value: Any) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     return re.sub(r"\s+", " ", text).strip().lower()
 
-
 def derive_target(diagnosis: Any) -> int:
     return int(any(t in normalize_text(diagnosis) for t in HIGH_GRADE_TERMS))
 
-
 def read_excel_from_zip(archive: zipfile.ZipFile, member: str, header: int) -> pd.DataFrame:
     return pd.read_excel(BytesIO(archive.read(member)), header=header)
-
 
 def index_zip_images(archive: zipfile.ZipFile) -> dict[str, str]:
     index: dict[str, str] = {}
@@ -448,7 +326,6 @@ def index_zip_images(archive: zipfile.ZipFile) -> dict[str, str]:
             raise ValueError(f"Nome duplicado no ZIP: {fname}")
         index[fname] = member
     return index
-
 
 def assign_case_splits(
     metadata: pd.DataFrame,
@@ -474,7 +351,6 @@ def assign_case_splits(
     mapping.update({pid: "val" for pid in val_ids})
     mapping.update({pid: "test" for pid in test_ids})
     return metadata["patient_id"].map(mapping)
-
 
 def prepare_iarc_dataset(
     zip_path: str | Path = DEFAULT_IARC_ZIP,
@@ -554,80 +430,6 @@ def prepare_iarc_dataset(
     print(case_manifest.groupby(["split", "label"])["patient_id"].nunique().to_string())
     return image_manifest, case_manifest
 
-
-def prepare_intel_dataset(
-    zip_path: str | Path = DEFAULT_INTEL_ZIP,
-    output_dir: str | Path = DEFAULT_INTEL_DATA_DIR,
-    val_fraction: float = 0.15,
-    seed: int = 42,
-) -> pd.DataFrame:
-    """
-    Extrai e organiza o Intel & MobileODT Cervical Cancer Screening dataset.
-
-    Estrutura ZIP suportada (qualquer nivel de profundidade):
-        .../Type_1/imagem.jpg
-        .../Type_2/imagem.jpg
-        .../Type_3/imagem.jpg
-
-    Retorna DataFrame com colunas: image_path, label, target (0/1/2), split, patient_id.
-    """
-    zip_path   = Path(zip_path).resolve()
-    output_dir = ensure_dir(output_dir)
-    if not zip_path.exists():
-        raise FileNotFoundError(
-            f"ZIP Intel nao encontrado: {zip_path}\n"
-            "Baixe em: kaggle.com/competitions/intel-mobileodt-cervical-cancer-screening"
-        )
-
-    print(f"Lendo ZIP Intel: {zip_path}")
-    records: list[dict] = []
-    with zipfile.ZipFile(zip_path) as archive:
-        for member in archive.namelist():
-            p = PurePosixPath(member)
-            if p.suffix.lower() not in IMAGE_EXTENSIONS:
-                continue
-            # Busca Type_X em qualquer posicao na hierarquia
-            label = None
-            for part in p.parts:
-                if part in INTEL_LABEL_TO_INDEX:
-                    label = part
-                    break
-            if label is None:
-                continue
-            fname    = p.name
-            dest_rel = Path("images") / label / fname
-            dest     = output_dir / dest_rel
-            ensure_dir(dest.parent)
-            if not dest.exists():
-                with archive.open(member) as src, dest.open("wb") as tgt:
-                    tgt.write(src.read())
-            records.append({
-                "image_path": dest_rel.as_posix(),
-                "label":      label,
-                "target":     INTEL_LABEL_TO_INDEX[label],
-                "patient_id": p.stem,
-            })
-
-    if not records:
-        raise ValueError(
-            "Nenhuma imagem Type_1/2/3 encontrada no ZIP. "
-            "Verifique que o arquivo contem subpastas Type_1/, Type_2/, Type_3/."
-        )
-
-    manifest = pd.DataFrame(records)
-    train_df, val_df = train_test_split(
-        manifest, test_size=val_fraction, stratify=manifest["target"], random_state=seed
-    )
-    manifest.loc[train_df.index, "split"] = "train"
-    manifest.loc[val_df.index,   "split"] = "val"
-
-    out_csv = output_dir / "intel_manifest.csv"
-    manifest.to_csv(out_csv, index=False, encoding="utf-8")
-    print(f"Intel dataset: {len(manifest)} imagens  -> {out_csv}")
-    print(manifest.groupby(["split", "label"])["patient_id"].count().to_string())
-    return manifest
-
-
 # ---------------------------------------------------------------------------
 # Dataset, transforms e DataLoaders
 # ---------------------------------------------------------------------------
@@ -644,106 +446,18 @@ class LabelSmoothingBCE(nn.Module):
             logits, targets, pos_weight=self.pos_weight
         )
 
-
-class FocalLoss(nn.Module):
-    """BCE com Focal weighting (Lin et al. 2017). gamma>2 foca nos exemplos difíceis.
-    smooth>0 aplica label smoothing para evitar super-confiança e melhorar generalização."""
-    def __init__(self, gamma: float = 2.5, pos_weight: torch.Tensor | None = None,
-                 smooth: float = 0.05):
+class FocalLoss(nn.Module):   
+    def __init__(self, gamma: float = 2.0, pos_weight: torch.Tensor | None = None):
         super().__init__()
         self.gamma = gamma
         self.pos_weight = pos_weight
-        self.smooth = smooth
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        if self.smooth > 0:
-            targets = targets * (1.0 - self.smooth) + 0.5 * self.smooth
         bce = nn.functional.binary_cross_entropy_with_logits(
             logits, targets, pos_weight=self.pos_weight, reduction="none"
         )
         pt = torch.exp(-bce)
         return ((1 - pt) ** self.gamma * bce).mean()
-
-
-class AsymmetricLoss(nn.Module):
-    """Asymmetric Loss (Ridnik et al. 2021).
-
-    gamma_neg > gamma_pos penaliza falsos negativos mais fortemente que falsos
-    positivos — ideal para detecção de câncer onde FN é crítico.
-    clip>0 desloca a probabilidade dos negativos para cima, evitando gradientes
-    triviais de exemplos negativos muito fáceis.
-    """
-    def __init__(self, gamma_neg: float = 4.0, gamma_pos: float = 0.0,
-                 clip: float = 0.05, pos_weight: torch.Tensor | None = None):
-        super().__init__()
-        self.gamma_neg = gamma_neg
-        self.gamma_pos = gamma_pos
-        self.clip      = clip
-        self.pos_weight = pos_weight
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs     = torch.sigmoid(logits)
-        probs_neg = (1.0 - probs + self.clip).clamp(max=1.0)
-        los_pos   = targets       * torch.log(probs.clamp(min=1e-8))
-        los_neg   = (1 - targets) * torch.log(probs_neg.clamp(min=1e-8))
-        loss      = los_pos + los_neg
-        pt0       = probs     * targets
-        pt1       = probs_neg * (1 - targets)
-        pt        = pt0 + pt1
-        gamma     = self.gamma_pos * targets + self.gamma_neg * (1 - targets)
-        loss     *= (1 - pt.clamp(max=1)) ** gamma
-        if self.pos_weight is not None:
-            loss *= (targets * self.pos_weight + (1 - targets))
-        return -loss.mean()
-
-
-class SAM(torch.optim.Optimizer):
-    """Sharpness-Aware Minimization (Foret et al. 2021).
-
-    Busca mínimos planos (flat minima) que generalizam melhor em datasets
-    pequenos.  Envolve o otimizador base (AdamW) e requer 2 forward passes
-    por batch (~30% mais lento).  Usar com use_sam=True no train_model.
-    """
-    def __init__(self, params, base_optimizer_cls, rho: float = 0.05, **kwargs):
-        defaults = dict(rho=rho, **kwargs)
-        super().__init__(params, defaults)
-        self.base_optimizer = base_optimizer_cls(self.param_groups, **kwargs)
-        self.param_groups   = self.base_optimizer.param_groups
-        self.defaults.update(self.base_optimizer.defaults)
-
-    @torch.no_grad()
-    def first_step(self, zero_grad: bool = False) -> None:
-        norm = self._grad_norm()
-        for group in self.param_groups:
-            scale = group["rho"] / (norm + 1e-12)
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                self.state[p]["old_p"] = p.data.clone()
-                p.add_(p.grad * scale)
-        if zero_grad:
-            self.zero_grad()
-
-    @torch.no_grad()
-    def second_step(self, zero_grad: bool = False) -> None:
-        for group in self.param_groups:
-            for p in group["params"]:
-                if "old_p" in self.state[p]:
-                    p.data = self.state[p]["old_p"]
-        self.base_optimizer.step()
-        if zero_grad:
-            self.zero_grad()
-
-    def _grad_norm(self) -> torch.Tensor:
-        device = self.param_groups[0]["params"][0].device
-        norms  = [p.grad.norm(2).to(device)
-                  for g in self.param_groups for p in g["params"] if p.grad is not None]
-        return torch.stack(norms).norm(2) if norms else torch.tensor(0.0, device=device)
-
-    def load_state_dict(self, state_dict):
-        super().load_state_dict(state_dict)
-        self.base_optimizer.param_groups = self.param_groups
-
 
 class CervixImageDataset(Dataset):
     def __init__(
@@ -773,7 +487,6 @@ class CervixImageDataset(Dataset):
             raise RuntimeError(f"Tensor inválido na imagem: {img_path}")
         return img, torch.tensor(target, dtype=torch.float32), str(row["patient_id"])
 
-
 def load_manifest(path: str | Path) -> pd.DataFrame:
     manifest = pd.read_csv(path)
     required = {"image_path", "patient_id", "label", "split"}
@@ -790,69 +503,10 @@ def load_manifest(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"Vazamento de pacientes: {list(leaking.index[:10])}")
     return manifest
 
-
-_ALB_PRINTED = False  # impede que build_transforms imprima a mesma linha repetidamente
-
-
-class _AlbumentationsWrap:
-    """Converte PIL→numpy, aplica albumentations, retorna PIL. Usado no pipeline torchvision."""
-    def __init__(self, alb_transform):
-        self.t = alb_transform
-
-    def __call__(self, img: "Image.Image") -> "Image.Image":
-        arr = np.array(img)
-        out = self.t(image=arr)["image"]
-        return Image.fromarray(out)
-
-
-def _make_alb_train():
-    """Retorna wrapper albumentations para treino, ou None se não instalado."""
-    try:
-        import albumentations as A
-        # CoarseDropout mudou API na v1.4: max_holes→num_holes_range, fill_value→fill
-        ver = tuple(int(x) for x in A.__version__.split(".")[:2])
-        if ver >= (1, 4):
-            dropout_aug = A.CoarseDropout(
-                num_holes_range=(1, 4),
-                hole_height_range=(8, 24),
-                hole_width_range=(8, 24),
-                fill=0, p=0.3,
-            )
-        else:
-            dropout_aug = A.CoarseDropout(
-                max_holes=4, max_height=24, max_width=24,
-                min_holes=1, fill_value=0, p=0.3,
-            )
-        return _AlbumentationsWrap(A.Compose([
-            A.GridDistortion(num_steps=5, distort_limit=0.25, p=0.4),
-            A.ElasticTransform(alpha=60, sigma=6, p=0.3),
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.35),
-            dropout_aug,
-        ]))
-    except ImportError:
-        return None
-
-
-def build_transforms(image_size: int) -> dict[str, transforms.Compose]:
-    """
-    Augmentação agressiva para imagens de colposcopia:
-    - Geométrica: rotação 30°, perspectiva 35%, affine com shear 12, crop 15%
-    - Cor: ColorJitter forte + AutoContrast + Sharpness (acetowhite varia muito)
-    - Albumentations (se instalado): GridDistortion, ElasticTransform, CLAHE, CoarseDropout
-    - RandomErasing duplo: simula reflexos especulares múltiplos
-    - Mixup/CutMix aplicado no nível de batch no loop de treino
-    """
+def build_transforms(image_size: int) -> dict[str, transforms.Compose]:  
     mean = [0.485, 0.456, 0.406]
     std  = [0.229, 0.224, 0.225]
     pad  = int(image_size * 0.15)
-
-    global _ALB_PRINTED
-    alb = _make_alb_train()
-    alb_steps = [alb] if alb is not None else []
-    if alb is not None and not _ALB_PRINTED:
-        print("  Albumentations: GridDistortion + ElasticTransform + CLAHE + CoarseDropout")
-        _ALB_PRINTED = True
-
     return {
         "train": transforms.Compose([
             transforms.Resize((image_size + pad, image_size + pad)),
@@ -863,7 +517,6 @@ def build_transforms(image_size: int) -> dict[str, transforms.Compose]:
             transforms.RandomPerspective(distortion_scale=0.35, p=0.5),
             transforms.RandomAffine(degrees=20, translate=(0.12, 0.12),
                                     scale=(0.80, 1.20), shear=12),
-            *alb_steps,
             transforms.ColorJitter(brightness=0.45, contrast=0.40,
                                    saturation=0.35, hue=0.12),
             transforms.RandomAdjustSharpness(sharpness_factor=2, p=0.4),
@@ -889,14 +542,7 @@ def create_dataloaders(
     image_size: int,
     batch_size: int,
     num_workers: int = 0,
-    use_weighted_sampler: bool = True,
 ) -> dict[str, DataLoader]:
-    """Cria DataLoaders para todos os splits.
-
-    use_weighted_sampler=True: oversampling de positivos no treino via
-    WeightedRandomSampler (complementa pos_weight na loss, não substitui).
-    Garante que cada batch veja ~50/50 de positivos e negativos.
-    """
     tfm = build_transforms(image_size)
     loaders: dict[str, DataLoader] = {}
     for split in ["train", "val", "test", "external_test"]:
@@ -905,23 +551,11 @@ def create_dataloaders(
             continue
         ds = CervixImageDataset(frame, image_root=image_root,
                                 transform=tfm["train" if split == "train" else "eval"])
-        if split == "train" and use_weighted_sampler:
-            tgts = frame["target"].values
-            counts = np.bincount(tgts.astype(int))
-            w = 1.0 / counts[tgts.astype(int)]
-            sampler = torch.utils.data.WeightedRandomSampler(
-                weights=w, num_samples=len(w), replacement=True)
-            loaders[split] = DataLoader(
-                ds, batch_size=batch_size, sampler=sampler,
-                num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-            )
-        else:
-            loaders[split] = DataLoader(
-                ds, batch_size=batch_size, shuffle=(split == "train"),
-                num_workers=num_workers, pin_memory=torch.cuda.is_available(),
-            )
+        loaders[split] = DataLoader(
+            ds, batch_size=batch_size, shuffle=(split == "train"),
+            num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+        )
     return loaders
-
 
 # ---------------------------------------------------------------------------
 # Modelo
@@ -931,21 +565,8 @@ def build_model(
     architecture: str = "efficientnet_b3",
     pretrained: bool = True,
     dropout: float = 0.40,
-    pretrained_backbone_path: str | Path | None = None,
 ) -> nn.Module:
-    """
-    Arquiteturas suportadas:
-      resnet34          — linha de base rápida
-      efficientnet_b3   — RECOMENDADO padrão (1536 features, compound scaling)
-      efficientnet_b4   — maior receptive field (448px), melhor para lesões difusas
-      efficientnet_b5   — ainda maior capacidade (2048 features), image_size 456px
-      convnext_tiny     — melhor calibração e menos overfitting em datasets pequenos
-      convnext_small    — convnext_tiny escalado 2×, bom trade-off custo/qualidade
-    Cabeça: Dropout -> Linear(256) -> ReLU -> Dropout(1/2) -> Linear(1)
-
-    pretrained_backbone_path: se fornecido, substitui os pesos do backbone (features)
-        pelo checkpoint de pre-treino Intel, mantendo a cabeca re-inicializada.
-    """
+    
     def _head(in_f: int) -> nn.Sequential:
         return nn.Sequential(
             nn.Dropout(dropout),
@@ -959,32 +580,18 @@ def build_model(
         weights = models.ResNet34_Weights.DEFAULT if pretrained else None
         model = models.resnet34(weights=weights)
         model.fc = _head(model.fc.in_features)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
         return model
 
     if architecture == "efficientnet_b3":
         weights = models.EfficientNet_B3_Weights.DEFAULT if pretrained else None
         model = models.efficientnet_b3(weights=weights)
         model.classifier = _head(model.classifier[1].in_features)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
         return model
 
     if architecture == "efficientnet_b4":
         weights = models.EfficientNet_B4_Weights.DEFAULT if pretrained else None
         model = models.efficientnet_b4(weights=weights)
         model.classifier = _head(model.classifier[1].in_features)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
-        return model
-
-    if architecture == "efficientnet_b5":
-        weights = models.EfficientNet_B5_Weights.DEFAULT if pretrained else None
-        model = models.efficientnet_b5(weights=weights)
-        model.classifier = _head(model.classifier[1].in_features)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
         return model
 
     if architecture == "convnext_tiny":
@@ -992,246 +599,32 @@ def build_model(
         model = models.convnext_tiny(weights=weights)
         in_f = model.classifier[2].in_features
         model.classifier[2] = _head(in_f)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
-        return model
-
-    if architecture == "convnext_small":
-        weights = models.ConvNeXt_Small_Weights.DEFAULT if pretrained else None
-        model = models.convnext_small(weights=weights)
-        in_f = model.classifier[2].in_features
-        model.classifier[2] = _head(in_f)
-        if pretrained_backbone_path:
-            _load_intel_backbone(model, pretrained_backbone_path)
         return model
 
     raise ValueError(f"Arquitetura não suportada: {architecture}")
 
 
-def _get_base_module(model: nn.Module) -> nn.Module:
-    """Retorna o módulo base, ignorando DataParallel wrapper se presente."""
-    return model.module if isinstance(model, nn.DataParallel) else model
-
-
-def _load_intel_backbone(model: nn.Module, path: str | Path) -> None:
-    """Carrega pesos do backbone Intel no modelo binário (substitui features)."""
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    backbone_sd = ckpt.get("backbone_state_dict", {})
-    if not backbone_sd:
-        print(f"  Aviso: 'backbone_state_dict' nao encontrado em {path}")
-        return
-    base = _get_base_module(model)
-    missing, unexpected = base.features.load_state_dict(backbone_sd, strict=False)
-    n_loaded = len(backbone_sd) - len(missing)
-    val_acc  = ckpt.get("val_accuracy", float("nan"))
-    print(f"  Backbone Intel carregado: {n_loaded}/{len(backbone_sd)} camadas "
-          f"(val_acc Intel={val_acc:.3f})")
-    if missing:
-        print(f"    missing={len(missing)}")
-
-
-def _wrap_dataparallel(model: nn.Module, device: torch.device) -> nn.Module:
-    """Envolve modelo com DataParallel se houver múltiplas GPUs disponíveis."""
-    if torch.cuda.device_count() > 1:
-        print(f"  DataParallel ativado: {torch.cuda.device_count()} GPUs")
-        return nn.DataParallel(model)
-    return model
-
-
-def pretrain_backbone(
-    manifest_path: str | Path,
-    image_root: str | Path,
-    output_path: str | Path = DEFAULT_INTEL_PRETRAIN,
-    architecture: str = "efficientnet_b3",
-    image_size: int = 384,
-    batch_size: int = 16,
-    epochs: int = 30,
-    learning_rate: float = 3e-4,
-    weight_decay: float = 0.01,
-    freeze_epochs: int = 3,
-    device_name: str = "auto",
-    seed: int = 42,
-) -> Path:
-    """
-    Fase 1: pre-treina o backbone no Intel & MobileODT (3 classes: Type_1/2/3).
-    Salva apenas os pesos do backbone (features) em output_path para uso posterior
-    em train_model(pretrained_backbone_path=...).
-
-    Fluxo recomendado:
-        python script.py pretrain --zip INTEL.zip
-        python script.py train --pretrained-backbone outputs/arquivo_unico/pretrain_backbone.pt
-    """
-    set_seed(seed)
-    output_path = Path(output_path)
-    ensure_dir(output_path.parent)
-    device = select_device(device_name)
-    nw     = 2 if torch.cuda.is_available() else 0
-
-    intel_manifest = pd.read_csv(manifest_path)
-    tfm = build_transforms(image_size)
-
-    def _make_loader(split: str, shuffle: bool) -> DataLoader:
-        df = intel_manifest[intel_manifest["split"] == split].copy()
-        ds = CervixImageDataset(df, image_root,
-                                transform=tfm["train" if shuffle else "eval"])
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle,
-                          num_workers=nw, pin_memory=torch.cuda.is_available())
-
-    train_loader = _make_loader("train", shuffle=True)
-    val_loader   = _make_loader("val",   shuffle=False)
-
-    n_train = len(intel_manifest[intel_manifest["split"] == "train"])
-    n_val   = len(intel_manifest[intel_manifest["split"] == "val"])
-    print(f"\nPRE-TREINO Intel & MobileODT | {architecture} | {image_size}px | "
-          f"{n_train} treino / {n_val} val | {epochs} epocas")
-    print(f"Dispositivo: {device}")
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
-
-    # Modelo multi-classe (3 saidas) com ImageNet como ponto de partida
-    def _head3(in_f: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Dropout(0.40),
-            nn.Linear(in_f, 256),
-            nn.ReLU(),
-            nn.Dropout(0.20),
-            nn.Linear(256, INTEL_N_CLASSES),
-        )
-
-    if architecture in ("efficientnet_b3", "efficientnet_b4", "efficientnet_b5"):
-        _w_map = {
-            "efficientnet_b3": models.EfficientNet_B3_Weights.DEFAULT,
-            "efficientnet_b4": models.EfficientNet_B4_Weights.DEFAULT,
-            "efficientnet_b5": models.EfficientNet_B5_Weights.DEFAULT,
-        }
-        _m_fn  = {
-            "efficientnet_b3": models.efficientnet_b3,
-            "efficientnet_b4": models.efficientnet_b4,
-            "efficientnet_b5": models.efficientnet_b5,
-        }
-        model = _m_fn[architecture](weights=_w_map[architecture])
-        in_f  = model.classifier[1].in_features
-        model.classifier = _head3(in_f)
-    elif architecture in ("convnext_tiny", "convnext_small"):
-        _w_map = {
-            "convnext_tiny":  models.ConvNeXt_Tiny_Weights.DEFAULT,
-            "convnext_small": models.ConvNeXt_Small_Weights.DEFAULT,
-        }
-        _m_fn  = {
-            "convnext_tiny":  models.convnext_tiny,
-            "convnext_small": models.convnext_small,
-        }
-        model = _m_fn[architecture](weights=_w_map[architecture])
-        in_f  = model.classifier[2].in_features
-        model.classifier[2] = _head3(in_f)
-    else:
-        raise ValueError(f"Arquitetura nao suportada para pre-treino: {architecture}")
-
-    model = model.to(device)
-    # DataParallel desativado no pretrain (módulo customizado _head3 causa conflito)
-    # Pretrain é rápido com 1 GPU (30 min); treino IARC usa 2 GPUs
-
-    # CrossEntropyLoss com label smoothing — adequado para 3 classes
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
-
-    base = _get_base_module(model)
-    backbone_params = list(base.features.parameters())
-    head_params     = list(base.classifier.parameters())
-    optimizer = AdamW([
-        {"params": backbone_params, "lr": learning_rate * 0.1},
-        {"params": head_params,     "lr": learning_rate},
-    ], weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6)
-
-    best_val_acc = 0.0
-    best_state   = copy.deepcopy(model.state_dict())
-
-    for epoch in range(epochs):
-        # Freeze backbone nas primeiras epocas (head aquece primeiro)
-        for p in model.features.parameters():
-            p.requires_grad = (epoch >= freeze_epochs)
-
-        # --- treino ---
-        model.train()
-        total_loss, correct, total = 0.0, 0, 0
-        bar = tqdm(train_loader, desc=f"Pretrain {epoch+1:02d}/{epochs}", leave=False)
-        for imgs, targets, _ in bar:
-            imgs    = imgs.to(device)
-            targets = targets.long().to(device)   # CrossEntropyLoss exige long
-            optimizer.zero_grad()
-            out  = model(imgs)                    # um único forward pass
-            loss = criterion(out, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_loss += loss.item() * imgs.size(0)
-            correct    += (out.detach().argmax(1) == targets).sum().item()
-            total      += imgs.size(0)
-            bar.set_postfix(loss=f"{loss.item():.3f}")
-        scheduler.step(epoch + 1)
-        train_acc = correct / max(total, 1)
-
-        # --- validacao ---
-        model.eval()
-        val_correct, val_total = 0, 0
-        with torch.no_grad():
-            for imgs, targets, _ in val_loader:
-                imgs    = imgs.to(device)
-                targets = targets.long().to(device)
-                val_correct += (model(imgs).argmax(1) == targets).sum().item()
-                val_total   += imgs.size(0)
-        val_acc = val_correct / max(val_total, 1)
-
-        print(f"Pretrain {epoch+1:02d}/{epochs} | "
-              f"Loss={total_loss/max(total,1):.4f} | "
-              f"TrainAcc={train_acc:.3f} | ValAcc={val_acc:.3f}")
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state   = copy.deepcopy(model.state_dict())
-
-    model.load_state_dict(best_state)
-
-    # Salva apenas o backbone (features) para ser carregado em build_model()
-    torch.save({
-        "backbone_state_dict": model.features.state_dict(),
-        "architecture": architecture,
-        "val_accuracy": best_val_acc,
-        "n_classes":    INTEL_N_CLASSES,
-        "image_size":   image_size,
-    }, output_path)
-    print(f"\nBackbone Intel salvo: {output_path}  (melhor val_acc={best_val_acc:.3f})")
-    print("Use com: python script.py train "
-          f"--pretrained-backbone \"{output_path}\"")
-    return output_path
-
-
 def set_backbone_trainable(model: nn.Module, architecture: str, trainable: bool) -> None:
     for p in model.parameters():
         p.requires_grad = trainable
-    base = _get_base_module(model)
     if architecture == "resnet34":
-        head = base.fc
+        head = model.fc
     elif architecture == "convnext_tiny":
-        head = base.classifier
+        head = model.classifier
     else:
-        head = base.classifier
+        head = model.classifier
     for p in head.parameters():
         p.requires_grad = True
 
 
 def _gradcam_target_layer(model: nn.Module, architecture: str) -> nn.Module:
-    base = _get_base_module(model)
     if architecture == "resnet34":
-        return base.layer4[-1]
-    if architecture in ("efficientnet_b3", "efficientnet_b4", "efficientnet_b5"):
-        return base.features[-1]
-    if architecture in ("convnext_tiny", "convnext_small"):
-        return base.features[-1][-1]
+        return model.layer4[-1]
+    if architecture in ("efficientnet_b3", "efficientnet_b4"):
+        return model.features[-1]
+    if architecture == "convnext_tiny":
+        return model.features[-1][-1]
     raise ValueError(f"GradCAM não suportado para {architecture}")
-
 
 # ---------------------------------------------------------------------------
 # GradCAM
@@ -1322,12 +715,7 @@ def _make_gradcam_5panel(
     suptitle: str = "",
     save_path: str | Path | None = None,
 ) -> None:
-    """
-    Gera painel 2×3 (6ª célula vazia) seguindo o layout de referência:
-      [0] Imagem Original   [1] Grad-CAM Colorido   [2] Grad-CAM Sobreposto
-      [3] Bounding Box      [4] Heatmap + Bbox       [5] (vazio)
-    Bbox e rótulo em amarelo.
-    """
+ 
     if img_np.dtype != np.uint8:
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
 
@@ -1410,14 +798,7 @@ def generate_gradcam_exemplars(
     case_targets: np.ndarray,
     case_probabilities: np.ndarray,
 ) -> None:
-    """
-    Gera um painel 2×2 com um exemplar GradCAM por tipo de classificação:
-        TP (verdadeiro positivo)  — maior confiança correta positiva
-        TN (verdadeiro negativo)  — menor probabilidade correta negativa
-        FP (falso positivo)       — maior confiança errada positiva
-        FN (falso negativo)       — menor probabilidade errada negativa
-    Salva em: output_dir/gradcam_exemplars_panel.png
-    """
+  
     ensure_dir(output_dir)
     preds = (case_probabilities >= threshold).astype(int)
 
@@ -1498,8 +879,7 @@ def generate_gradcam_exemplars(
             save_path=hm_path,
         )
         print(f"  GradCAM 5-panel [{outcome}]: {hm_path}")
-
-    # --- Painel resumo 2×2 (apenas overlays, para visão geral) ---
+    
     fig, axes = plt.subplots(2, 2, figsize=(16, 16))
     axes = axes.flatten()
 
@@ -1549,7 +929,6 @@ def generate_gradcam_dataset(
             dataset.image_root / dataset.manifest.iloc[idx]["image_path"],
             image_size, threshold, out_file, device, architecture,
         )
-
 
 # ---------------------------------------------------------------------------
 # Métricas
@@ -1637,37 +1016,30 @@ def bootstrap_confidence_intervals(
 def optimize_threshold(
     targets: np.ndarray,
     probabilities: np.ndarray,
-    min_sensitivity: float = 0.95,
+    min_sensitivity: float = 0.80,
 ) -> tuple[float, float]:
-    """
-    Estratégia clínica: entre todos os thresholds com Sens >= min_sensitivity,
-    escolhe o que maximiza Specificity (menos FP sem perder FN).
-    Fallback em cascata: 0.95 → 0.90 → 0.80 → melhor F1.
-    """
+    
     if np.isnan(probabilities).any():
         raise RuntimeError("NaN em probabilidades durante optimize_threshold")
 
-    thresholds = np.arange(0.05, 0.95, 0.01)
-
-    for min_sens in [min_sensitivity, 0.90, 0.80]:
-        best_t, best_spec = 0.35, -1.0
-        for t in thresholds:
-            m = binary_metrics(targets, probabilities, float(t))
-            if m["sensitivity_recall"] >= min_sens and m["specificity"] > best_spec:
-                best_spec = m["specificity"]
-                best_t = float(t)
-        if best_spec >= 0:
-            return best_t, best_spec
-
-    # último fallback: melhor F1
-    best_t, best_f1 = 0.35, -1.0
-    for t in thresholds:
+    best_t, best_score = 0.35, -1.0
+    for t in np.arange(0.05, 0.95, 0.01):
         m = binary_metrics(targets, probabilities, float(t))
-        if m["f1"] > best_f1:
-            best_f1 = m["f1"]
-            best_t = float(t)
-    return best_t, best_f1
+        if m["sensitivity_recall"] < min_sensitivity:
+            continue
+        score = m["f1"]
+        if score > best_score:
+            best_score, best_t = score, float(t)
+    
+    if best_score < 0:
+        for t in np.arange(0.05, 0.95, 0.01):
+            m = binary_metrics(targets, probabilities, float(t))
+            if m["sensitivity_recall"] >= 0.5:
+                best_t = float(t)
+                best_score = m["f1"]
+                break
 
+    return best_t, best_score
 
 # ---------------------------------------------------------------------------
 # Treinamento, avaliação e inferência
@@ -1678,34 +1050,11 @@ def mixup_batch(
     targets: torch.Tensor,
     alpha: float = 0.4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mixup: combina pares aleatórios de imagens/labels para regularização."""
+    
     lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
     idx = torch.randperm(images.size(0), device=images.device)
     return (lam * images + (1 - lam) * images[idx],
             lam * targets + (1 - lam) * targets[idx])
-
-
-def cutmix_batch(
-    images: torch.Tensor,
-    targets: torch.Tensor,
-    alpha: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """CutMix (Yun et al. 2019): substitui patch retangular por patch de outra
-    imagem.  Preserva estrutura local enquanto força o modelo a usar todo o
-    campo receptivo, complementando o MixUp."""
-    lam  = float(np.random.beta(alpha, alpha))
-    B, _, H, W = images.shape
-    idx  = torch.randperm(B, device=images.device)
-    cut_ratio = float(np.sqrt(1.0 - lam))
-    cut_h, cut_w = int(H * cut_ratio), int(W * cut_ratio)
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-    x1, x2 = max(0, cx - cut_w // 2), min(W, cx + cut_w // 2)
-    y1, y2 = max(0, cy - cut_h // 2), min(H, cy + cut_h // 2)
-    mixed = images.clone()
-    mixed[:, :, y1:y2, x1:x2] = images[idx, :, y1:y2, x1:x2]
-    lam_actual = 1.0 - (x2 - x1) * (y2 - y1) / (W * H)
-    return mixed, lam_actual * targets + (1 - lam_actual) * targets[idx]
 
 
 def predict_loader(
@@ -1713,60 +1062,52 @@ def predict_loader(
     loader: DataLoader,
     device: torch.device,
     temperature: float = 1.0,
-    tta_scales: list[int] | None = None,
 ) -> dict[str, Any]:
-    """
-    TTA multi-escala: para cada escala em tta_scales, aplica 8 vistas geométricas.
-    Total de vistas = 8 × len(tta_scales). Média geométrica de todas.
-    Padrão: [384] (equivale ao comportamento anterior). Use [320, 384, 456] para 24 vistas.
-    """
-    def _infer(imgs: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(model(imgs).squeeze(1) / T)
-
-    def _rescale(imgs: torch.Tensor, size: int) -> torch.Tensor:
-        h, w = imgs.shape[-2], imgs.shape[-1]
-        if h == size and w == size:
-            return imgs
-        return F.interpolate(imgs, size=(size, size), mode="bilinear", align_corners=False)
-
-    def _views_for(imgs: torch.Tensor) -> list[torch.Tensor]:
-        return [
-            imgs,
-            torch.flip(imgs, dims=[3]),                           # hflip
-            torch.flip(imgs, dims=[2]),                           # vflip
-            torch.flip(imgs, dims=[2, 3]),                        # hvflip
-            torch.rot90(imgs, 1, [2, 3]),                         # rot90
-            torch.rot90(imgs, 2, [2, 3]),                         # rot180
-            torch.rot90(imgs, 3, [2, 3]),                         # rot270
-            torch.flip(torch.rot90(imgs, 1, [2, 3]), dims=[3]),  # rot90+hflip
-        ]
-
-    scales = tta_scales if tta_scales else [0]   # 0 = tamanho nativo do loader
+    
     model.eval()
     all_targets: list[float] = []
-    all_probs:  list[float] = []
-    all_pids:   list[str]   = []
+    all_probs: list[float] = []
+    all_pids: list[str] = []
     T = max(temperature, 1e-3)
-
     with torch.no_grad():
         for images, batch_targets, batch_pids in loader:
             images = images.to(device)
-            log_sum: torch.Tensor | None = None
-            n_views = 0
-            for sz in scales:
-                imgs = _rescale(images, sz) if sz > 0 else images
-                for v in _views_for(imgs):
-                    lp = torch.log(_infer(v).clamp(min=1e-7))
-                    log_sum = lp if log_sum is None else log_sum + lp
-                    n_views += 1
-            probs = torch.exp(log_sum / n_views).cpu().numpy()  # type: ignore[operator]
+            p_orig   = torch.sigmoid(model(images).squeeze(1)                         / T)
+            p_hflip  = torch.sigmoid(model(torch.flip(images, dims=[3])).squeeze(1)   / T)
+            p_vflip  = torch.sigmoid(model(torch.flip(images, dims=[2])).squeeze(1)   / T)
+            p_hvflip = torch.sigmoid(model(torch.flip(images, dims=[2, 3])).squeeze(1)/ T)
+            probs = ((p_orig + p_hflip + p_vflip + p_hvflip) / 4).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_targets.extend(batch_targets.numpy().tolist())
             all_pids.extend(list(batch_pids))
     return {
-        "targets":      np.asarray(all_targets, dtype=int),
-        "probabilities": np.asarray(all_probs,  dtype=float),
-        "patient_ids":  all_pids,
+        "targets": np.asarray(all_targets, dtype=int),
+        "probabilities": np.asarray(all_probs, dtype=float),
+        "patient_ids": all_pids,
+    }
+
+
+def predict_loader_simple(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> dict[str, Any]:
+    
+    model.eval()
+    all_targets: list[float] = []
+    all_probs: list[float] = []
+    all_pids: list[str] = []
+    with torch.no_grad():
+        for images, batch_targets, batch_pids in loader:
+            images = images.to(device)
+            probs = torch.sigmoid(model(images).squeeze(1)).cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_targets.extend(batch_targets.numpy().tolist())
+            all_pids.extend(list(batch_pids))
+    return {
+        "targets": np.asarray(all_targets, dtype=int),
+        "probabilities": np.asarray(all_probs, dtype=float),
+        "patient_ids": all_pids,
     }
 
 
@@ -1779,59 +1120,26 @@ def train_epoch(
     epoch: int,
     epochs: int,
     mixup_alpha: float = 0.4,
-    cutmix_alpha: float = 1.0,
-    use_sam: bool = False,
-    accumulation_steps: int = 1,
 ) -> float:
-    """Um epoch de treino.
-
-    Augmentação mista: 50% CutMix / 50% MixUp quando ambos alpha>0.
-    SAM: 2 forward passes por batch (acumulação desativada automaticamente com SAM).
-    Gradient accumulation: simula batch maior sem custo de memória adicional.
-    """
-    acc_steps = max(1, accumulation_steps) if not use_sam else 1
     model.train()
     running_loss = 0.0
     count = 0
-    if not use_sam:
-        optimizer.zero_grad(set_to_none=True)
     bar = tqdm(loader, desc=f"Treino {epoch + 1}/{epochs}", leave=False)
-    for step, (images, targets, _) in enumerate(bar):
+    for images, targets, _ in bar:
         images, targets = images.to(device), targets.to(device)
-        if cutmix_alpha > 0 and mixup_alpha > 0:
-            if np.random.random() < 0.5:
-                images, targets = cutmix_batch(images, targets, alpha=cutmix_alpha)
-            else:
-                images, targets = mixup_batch(images, targets, alpha=mixup_alpha)
-        elif cutmix_alpha > 0:
-            images, targets = cutmix_batch(images, targets, alpha=cutmix_alpha)
-        elif mixup_alpha > 0:
+        if mixup_alpha > 0:
             images, targets = mixup_batch(images, targets, alpha=mixup_alpha)
-
-        if use_sam:
-            logits = model(images).squeeze(1)
-            loss   = criterion(logits, targets)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.first_step(zero_grad=True)
-            criterion(model(images).squeeze(1), targets).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.second_step(zero_grad=True)
-        else:
-            logits = model(images).squeeze(1)
-            if not torch.isfinite(logits).all():
-                raise RuntimeError(f"Logits inválidos na época {epoch + 1}")
-            loss = criterion(logits, targets)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Loss inválida na época {epoch + 1}: {loss.item()}")
-            # escala a loss pelo número de steps acumulados
-            (loss / acc_steps).backward()
-            is_last_batch = (step + 1 == len(loader))
-            if (step + 1) % acc_steps == 0 or is_last_batch:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images).squeeze(1)
+        if not torch.isfinite(logits).all():
+            raise RuntimeError(f"Logits inválidos na época {epoch + 1}")
+        loss = criterion(logits, targets)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"Loss inválida na época {epoch + 1}: {loss.item()}")
+        loss.backward()
+        # Gradient clipping: estabiliza treino de fine-tuning
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
         bs = images.size(0)
         running_loss += float(loss.item()) * bs
         count += bs
@@ -1849,15 +1157,13 @@ def evaluate_splits(
     bootstrap_iterations: int,
     seed: int,
     temperature: float = 1.0,
-    tta_scales: list[int] | None = None,
 ) -> dict[str, Any]:
     output_dir = ensure_dir(output_dir)
     results: dict[str, Any] = {}
     for split in ["val", "test", "external_test"]:
         if split not in loaders:
             continue
-        pred = predict_loader(model, loaders[split], device, temperature=temperature,
-                              tta_scales=tta_scales)
+        pred = predict_loader(model, loaders[split], device, temperature=temperature)
         img_m = binary_metrics(pred["targets"], pred["probabilities"], threshold)
         ids, c_tgt, c_prob = aggregate_case_predictions(
             pred["patient_ids"], pred["targets"], pred["probabilities"])
@@ -1881,7 +1187,6 @@ def evaluate_splits(
     write_json(output_dir / "evaluation_metrics.json", results)
     return results
 
-
 # ---------------------------------------------------------------------------
 # Plots no terminal
 # ---------------------------------------------------------------------------
@@ -1895,10 +1200,7 @@ def _ascii_line_chart(
     y_decimals: int = 3,
     markers: dict[int, str] | None = None,
 ) -> list[str]:
-    """
-    Retorna lista de strings com gráfico de linha ASCII colorido.
-    markers = {epoch_idx: label} para marcar pontos especiais com ★.
-    """
+  
     R = "\033[0m"
     if not values:
         return []
@@ -1963,10 +1265,7 @@ def _ascii_scatter_chart(
     y_label: str = "y",
     diagonal: bool = False,
 ) -> list[str]:
-    """
-    Gráfico de dispersão/curva 2D em ASCII (ROC, PR, calibração).
-    Se diagonal=True, adiciona linha pontilhada de referência y=x.
-    """
+    
     R = "\033[0m"
     if not x_vals or not y_vals:
         return []
@@ -2034,7 +1333,7 @@ def _visual_len(s: str) -> int:
 
 
 def _side_by_side(charts: list[list[str]], sep: str = "  ") -> list[str]:
-    """Une N listas de linhas (gráficos ASCII) em display horizontal."""
+    
     if not charts:
         return []
     max_rows = max(len(c) for c in charts)
@@ -2057,12 +1356,7 @@ def print_training_terminal(
     case_probs: np.ndarray | None = None,
     threshold: float = 0.5,
 ) -> None:
-    """
-    Imprime no terminal:
-    1. Tabela de melhores métricas e época correspondente
-    2. Curvas de treino: Loss, AUC, F1 em ASCII
-    3. Curvas ROC e Precision-Recall em ASCII (se targets/probs fornecidos)
-    """
+ 
     enable_windows_ansi()
     R = "\033[0m"
     LINE = "═" * 72
@@ -2117,21 +1411,36 @@ def print_training_terminal(
               f"Sens={senss[ep]:.4f}  Spec={specs[ep]:.4f}  Loss={losses[ep]:.4f}")
 
     # ── Tabela completa por época ─────────────────────────────────────────
-    print(f"\n  {'Ép':>3}  {'Loss':>6}  {'AUC':>6}  {'F1':>6}  {'Sens':>6}  {'Spec':>6}")
-    print("  " + "─" * 45)
-    for h in history:
-        ep = h["epoch"]
-        m  = h["val_case_metrics"]
+    tr_aucs_h = [h.get("train_case_metrics", {}).get("roc_auc", float("nan")) for h in history]
+    tr_f1s_h  = [h.get("train_case_metrics", {}).get("f1",      float("nan")) for h in history]
+    has_tr_h  = any(np.isfinite(v) for v in tr_aucs_h)
+
+    if has_tr_h:
+        print(f"\n  {'Ép':>3}  {'Loss':>6}  {'trAUC':>6}  {'trF1':>6}  {'valAUC':>6}  {'valF1':>6}  {'Sens':>6}  {'Spec':>6}")
+        print("  " + "─" * 62)
+    else:
+        print(f"\n  {'Ép':>3}  {'Loss':>6}  {'AUC':>6}  {'F1':>6}  {'Sens':>6}  {'Spec':>6}")
+        print("  " + "─" * 45)
+
+    for h, tr_auc, tr_f1 in zip(history, tr_aucs_h, tr_f1s_h):
+        ep   = h["epoch"]
+        m    = h["val_case_metrics"]
         marker = "  ★" if ep == best_epoch else ""
         auc_v  = m.get("roc_auc",            float("nan"))
         f1_v   = m.get("f1",                 float("nan"))
         sens_v = m.get("sensitivity_recall", float("nan"))
         spec_v = m.get("specificity",        float("nan"))
         col = "\033[92m" if auc_v >= 0.85 else "\033[93m" if auc_v >= 0.70 else ""
-        print(f"  {ep:>3}  {h['train_loss']:6.4f}  "
-              f"{col}{auc_v:6.4f}{R}  {f1_v:6.4f}  {sens_v:6.4f}  {spec_v:6.4f}{marker}")
+        if has_tr_h:
+            tr_col = "\033[92m" if tr_auc >= 0.85 else "\033[93m" if tr_auc >= 0.70 else ""
+            print(f"  {ep:>3}  {h['train_loss']:6.4f}  "
+                  f"{tr_col}{tr_auc:6.4f}{R}  {tr_f1:6.4f}  "
+                  f"{col}{auc_v:6.4f}{R}  {f1_v:6.4f}  {sens_v:6.4f}  {spec_v:6.4f}{marker}")
+        else:
+            print(f"  {ep:>3}  {h['train_loss']:6.4f}  "
+                  f"{col}{auc_v:6.4f}{R}  {f1_v:6.4f}  {sens_v:6.4f}  {spec_v:6.4f}{marker}")
 
-    # ── Curvas de treino — 3 painéis lado a lado ──────────────────────────
+    # ── Curvas de treino — painéis lado a lado ────────────────────────────
     print(f"\n{LINE}")
     print("  PROGRESSO DE TREINAMENTO")
     print(LINE)
@@ -2150,11 +1459,24 @@ def print_training_terminal(
     for line in _side_by_side([c_loss, c_auc, c_f1], sep="   "):
         print(line)
 
+    if has_tr_h:
+        print()
+        c_tr_auc = _ascii_line_chart(tr_aucs_h, "ROC-AUC (treino)", "\033[91m", width=38, height=10)
+        c_vl_auc = _ascii_line_chart(aucs,       "ROC-AUC (val)",   "\033[94m", width=38, height=10)
+        c_tr_f1  = _ascii_line_chart(tr_f1s_h,   "F1 (treino)",     "\033[91m", width=38, height=10)
+        c_vl_f1  = _ascii_line_chart(f1s,         "F1 (val)",       "\033[92m", width=38, height=10)
+        print("  Treino (vermelho) vs Validação (azul/verde) por época:")
+        for line in _side_by_side([c_tr_auc, c_vl_auc], sep="   "):
+            print(line)
+        print()
+        for line in _side_by_side([c_tr_f1, c_vl_f1], sep="   "):
+            print(line)
+
     print()
 
-    c_sens = _ascii_line_chart(senss, "Sensibilidade",   "\033[95m",
+    c_sens = _ascii_line_chart(senss, "Sensibilidade (val)",   "\033[95m",
                                width=52, height=10)
-    c_spec = _ascii_line_chart(specs, "Especificidade",  "\033[96m",
+    c_spec = _ascii_line_chart(specs, "Especificidade (val)",  "\033[96m",
                                width=52, height=10)
 
     for line in _side_by_side([c_sens, c_spec], sep="   "):
@@ -2203,12 +1525,7 @@ def print_terminal_metrics(
     case_targets: np.ndarray | None = None,
     case_probs: np.ndarray | None = None,
 ) -> None:
-    """
-    Exibe no terminal:
-    - Tabela comparativa val vs teste com delta e IC 95%
-    - Matriz de confusão com bordas e cores TP/FP/TN/FN
-    - Curvas ROC e Precisão-Recall em ASCII lado a lado
-    """
+ 
     enable_windows_ansi()
     R = "\033[0m"
     LINE = "═" * 72
@@ -2344,46 +1661,45 @@ def print_terminal_metrics(
 # Geração de plots
 # ---------------------------------------------------------------------------
 
-def _show_png_terminal(path: str | Path) -> None:
-    """Renderiza o PNG salvo diretamente no terminal via ANSI 24-bit (▄ half-blocks)."""
-    try:
-        import shutil
-        enable_windows_ansi()
-        cols = min(160, shutil.get_terminal_size(fallback=(160, 40)).columns - 4)
-        show_image_terminal(path, width=cols)
-    except Exception:
-        pass
-
 def plot_calibration_curve(
     targets: np.ndarray,
     probabilities: np.ndarray,
     output_dir: Path,
+    val_targets: np.ndarray | None = None,
+    val_probs: np.ndarray | None = None,
 ) -> None:
-    """Curva de calibração (reliability diagram): mostra se probabilidades estão calibradas."""
+    
     if len(np.unique(targets)) < 2:
         return
-    prob_true, prob_pred = sk_calibration_curve(targets, probabilities, n_bins=10, strategy="quantile")
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(prob_pred, prob_true, marker="o", linewidth=2, label="Modelo")
+    fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot([0, 1], [0, 1], "--", color="gray", label="Calibração perfeita")
-    ax.fill_between(prob_pred, prob_true, prob_pred, alpha=0.15)
+    if val_targets is not None and val_probs is not None and len(np.unique(val_targets)) == 2:
+        prob_true_v, prob_pred_v = sk_calibration_curve(val_targets, val_probs, n_bins=10, strategy="quantile")
+        ax.plot(prob_pred_v, prob_true_v, marker="o", linewidth=2, color="tab:blue", label="Validação")
+        ax.fill_between(prob_pred_v, prob_true_v, prob_pred_v, alpha=0.10, color="tab:blue")
+    prob_true, prob_pred = sk_calibration_curve(targets, probabilities, n_bins=10, strategy="quantile")
+    ax.plot(prob_pred, prob_true, marker="s", linewidth=2, color="tab:orange", label="Teste")
+    ax.fill_between(prob_pred, prob_true, prob_pred, alpha=0.10, color="tab:orange")
     ax.set_xlabel("Probabilidade predita")
     ax.set_ylabel("Frequência observada")
-    ax.set_title("Curva de Calibração (Reliability Diagram)")
+    ax.set_title("Curva de Calibração (Reliability Diagram) — Validação vs Teste")
     ax.legend()
     ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_dir / "calibration_curve.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "calibration_curve.png")
 
     # versão interativa
     fig_go = go.Figure()
-    fig_go.add_trace(go.Scatter(x=prob_pred.tolist(), y=prob_true.tolist(),
-                                mode="lines+markers", name="Modelo"))
     fig_go.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
                                 line=dict(dash="dash"), name="Perfeito"))
-    fig_go.update_layout(title="Curva de Calibração",
+    if val_targets is not None and val_probs is not None and len(np.unique(val_targets)) == 2:
+        fig_go.add_trace(go.Scatter(x=prob_pred_v.tolist(), y=prob_true_v.tolist(),
+                                    mode="lines+markers", name="Validação"))
+    fig_go.add_trace(go.Scatter(x=prob_pred.tolist(), y=prob_true.tolist(),
+                                mode="lines+markers", name="Teste"))
+    fig_go.update_layout(title="Curva de Calibração — Validação vs Teste",
                          xaxis_title="Probabilidade predita",
                          yaxis_title="Frequência observada")
     fig_go.write_html(output_dir / "calibration_curve.html")
@@ -2394,8 +1710,10 @@ def plot_threshold_sweep(
     probabilities: np.ndarray,
     best_threshold: float,
     output_dir: Path,
+    val_targets: np.ndarray | None = None,
+    val_probs: np.ndarray | None = None,
 ) -> None:
-    """F1, Sensibilidade e Especificidade em função do threshold."""
+    
     if len(np.unique(targets)) < 2:
         return
     thresholds = np.arange(0.05, 0.951, 0.01)
@@ -2406,29 +1724,55 @@ def plot_threshold_sweep(
         senss.append(m["sensitivity_recall"])
         specs.append(m["specificity"])
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(thresholds, f1s,   linewidth=2, label="F1")
-    ax.plot(thresholds, senss, linewidth=2, label="Sensibilidade (Recall)")
-    ax.plot(thresholds, specs, linewidth=2, label="Especificidade")
-    ax.axvline(best_threshold, color="black", linestyle="--",
-               label=f"Threshold ótimo ({best_threshold:.2f})")
-    ax.set_xlabel("Threshold")
-    ax.set_ylabel("Valor da métrica")
-    ax.set_title("Métricas × Threshold")
-    ax.legend()
-    ax.grid(alpha=0.3)
+    has_val_sweep = val_targets is not None and val_probs is not None and len(np.unique(val_targets)) == 2
+    if has_val_sweep:
+        f1s_v, senss_v, specs_v = [], [], []
+        for t in thresholds:
+            m = binary_metrics(val_targets, val_probs, float(t))
+            f1s_v.append(m["f1"])
+            senss_v.append(m["sensitivity_recall"])
+            specs_v.append(m["specificity"])
+        fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+        for ax, (f1_data, sens_data, spec_data), title in zip(
+            axes,
+            [(f1s_v, senss_v, specs_v), (f1s, senss, specs)],
+            ["Validação", "Teste"],
+        ):
+            ax.plot(thresholds, f1_data,   linewidth=2, label="F1")
+            ax.plot(thresholds, sens_data, linewidth=2, label="Sensibilidade (Recall)")
+            ax.plot(thresholds, spec_data, linewidth=2, label="Especificidade")
+            ax.axvline(best_threshold, color="black", linestyle="--",
+                       label=f"Threshold ótimo ({best_threshold:.2f})")
+            ax.set_xlabel("Threshold"); ax.set_ylabel("Valor da métrica")
+            ax.set_title(f"Métricas × Threshold — {title}")
+            ax.legend(); ax.grid(alpha=0.3)
+        plt.suptitle("Métricas × Threshold — Validação vs Teste", fontsize=14)
+    else:
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(thresholds, f1s,   linewidth=2, label="F1")
+        ax.plot(thresholds, senss, linewidth=2, label="Sensibilidade (Recall)")
+        ax.plot(thresholds, specs, linewidth=2, label="Especificidade")
+        ax.axvline(best_threshold, color="black", linestyle="--",
+                   label=f"Threshold ótimo ({best_threshold:.2f})")
+        ax.set_xlabel("Threshold"); ax.set_ylabel("Valor da métrica")
+        ax.set_title("Métricas × Threshold — Teste")
+        ax.legend(); ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(output_dir / "threshold_sweep.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "threshold_sweep.png")
 
     # interativo
     fig_go = go.Figure()
-    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=f1s,   mode="lines", name="F1"))
-    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=senss, mode="lines", name="Sensibilidade"))
-    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=specs, mode="lines", name="Especificidade"))
+    if has_val_sweep:
+        fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=f1s_v,   mode="lines", name="F1 (Val)", line=dict(dash="dot")))
+        fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=senss_v, mode="lines", name="Sens. (Val)", line=dict(dash="dot")))
+        fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=specs_v, mode="lines", name="Spec. (Val)", line=dict(dash="dot")))
+    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=f1s,   mode="lines", name="F1 (Teste)"))
+    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=senss, mode="lines", name="Sensibilidade (Teste)"))
+    fig_go.add_trace(go.Scatter(x=thresholds.tolist(), y=specs, mode="lines", name="Especificidade (Teste)"))
     fig_go.add_vline(x=best_threshold, line_dash="dash", annotation_text=f"Threshold={best_threshold:.2f}")
-    fig_go.update_layout(title="Métricas × Threshold",
+    fig_go.update_layout(title="Métricas × Threshold — Validação vs Teste",
                          xaxis_title="Threshold", yaxis_title="Métrica")
     fig_go.write_html(output_dir / "threshold_sweep.html")
 
@@ -2440,57 +1784,218 @@ def generate_plots(
     output_dir: str | Path,
     threshold: float = 0.50,
     results: dict | None = None,
+    val_targets: np.ndarray | None = None,
+    val_probs: np.ndarray | None = None,
 ) -> None:
     output_dir = Path(output_dir)
 
     # --- Progresso de treino ---
     history_df = pd.DataFrame(history)
-    losses = history_df["train_loss"].tolist()
-    aucs   = [h["val_case_metrics"]["roc_auc"] for h in history]
-    f1s    = [h["val_case_metrics"]["f1"] for h in history]
-    epochs_ax = range(1, len(history) + 1)
+    losses     = history_df["train_loss"].tolist()
+    val_aucs   = [h["val_case_metrics"].get("roc_auc", float("nan")) for h in history]
+    val_f1s    = [h["val_case_metrics"].get("f1",      float("nan")) for h in history]
+    val_senss  = [h["val_case_metrics"].get("sensitivity_recall", float("nan")) for h in history]
+    val_specs  = [h["val_case_metrics"].get("specificity",        float("nan")) for h in history]
+    tr_aucs    = [h.get("train_case_metrics", {}).get("roc_auc", float("nan")) for h in history]
+    tr_f1s     = [h.get("train_case_metrics", {}).get("f1",      float("nan")) for h in history]
+    tr_senss   = [h.get("train_case_metrics", {}).get("sensitivity_recall", float("nan")) for h in history]
+    tr_specs   = [h.get("train_case_metrics", {}).get("specificity",        float("nan")) for h in history]
+    epochs_ax  = range(1, len(history) + 1)
+    has_tr     = any(np.isfinite(v) for v in tr_aucs)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    axes[0].plot(epochs_ax, losses, marker="o", linewidth=2, color="tab:red")
-    axes[0].set_title("Training Loss"); axes[0].set_xlabel("Época"); axes[0].grid(alpha=0.3)
-    axes[1].plot(epochs_ax, aucs, marker="s", linewidth=2, color="tab:blue")
-    axes[1].set_title("ROC-AUC (validação)"); axes[1].set_xlabel("Época"); axes[1].grid(alpha=0.3)
-    axes[2].plot(epochs_ax, f1s, marker="^", linewidth=2, color="tab:green")
-    axes[2].set_title("F1 (validação)"); axes[2].set_xlabel("Época"); axes[2].grid(alpha=0.3)
-    plt.suptitle("Progresso de Treinamento", fontsize=14)
+    # painel 2×3: Loss | AUC | F1 / Sens | Spec | (vazio)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+
+    # linha 0 — Loss
+    axes[0, 0].plot(epochs_ax, losses, marker="o", linewidth=2, color="tab:red", label="Treino")
+    axes[0, 0].set_title("Training Loss"); axes[0, 0].set_xlabel("Época"); axes[0, 0].grid(alpha=0.3)
+    axes[0, 0].legend()
+
+    # linha 0 — AUC
+    if has_tr:
+        axes[0, 1].plot(epochs_ax, tr_aucs, marker="o", linewidth=2, color="tab:red",  label="Treino")
+    axes[0, 1].plot(epochs_ax, val_aucs, marker="s", linewidth=2, color="tab:blue",  label="Validação")
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("roc_auc")
+        if _v is not None and np.isfinite(_v):
+            axes[0, 1].axhline(_v, color="tab:orange", linestyle="--", linewidth=2, label=f"Teste ({_v:.3f})")
+    axes[0, 1].set_title("ROC-AUC por Época"); axes[0, 1].set_xlabel("Época"); axes[0, 1].grid(alpha=0.3)
+    axes[0, 1].legend()
+
+    # linha 0 — F1
+    if has_tr:
+        axes[0, 2].plot(epochs_ax, tr_f1s, marker="o", linewidth=2, color="tab:red",   label="Treino")
+    axes[0, 2].plot(epochs_ax, val_f1s, marker="^", linewidth=2, color="tab:green", label="Validação")
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("f1")
+        if _v is not None and np.isfinite(_v):
+            axes[0, 2].axhline(_v, color="tab:orange", linestyle="--", linewidth=2, label=f"Teste ({_v:.3f})")
+    axes[0, 2].set_title("F1 por Época"); axes[0, 2].set_xlabel("Época"); axes[0, 2].grid(alpha=0.3)
+    axes[0, 2].legend()
+
+    # linha 1 — Sensibilidade
+    if has_tr:
+        axes[1, 0].plot(epochs_ax, tr_senss, marker="o", linewidth=2, color="tab:red",    label="Treino")
+    axes[1, 0].plot(epochs_ax, val_senss, marker="D", linewidth=2, color="tab:purple", label="Validação")
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("sensitivity_recall")
+        if _v is not None and np.isfinite(_v):
+            axes[1, 0].axhline(_v, color="tab:orange", linestyle="--", linewidth=2, label=f"Teste ({_v:.3f})")
+    axes[1, 0].set_title("Sensibilidade por Época"); axes[1, 0].set_xlabel("Época"); axes[1, 0].grid(alpha=0.3)
+    axes[1, 0].legend()
+
+    # linha 1 — Especificidade
+    if has_tr:
+        axes[1, 1].plot(epochs_ax, tr_specs, marker="o", linewidth=2, color="tab:red",  label="Treino")
+    axes[1, 1].plot(epochs_ax, val_specs, marker="P", linewidth=2, color="tab:cyan", label="Validação")
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("specificity")
+        if _v is not None and np.isfinite(_v):
+            axes[1, 1].axhline(_v, color="tab:orange", linestyle="--", linewidth=2, label=f"Teste ({_v:.3f})")
+    axes[1, 1].set_title("Especificidade por Época"); axes[1, 1].set_xlabel("Época"); axes[1, 1].grid(alpha=0.3)
+    axes[1, 1].legend()
+
+    axes[1, 2].set_visible(False)
+
+    plt.suptitle("Progresso de Treinamento — Treino / Validação / Teste (linha pontilhada)", fontsize=14)
     plt.tight_layout()
     plt.savefig(output_dir / "training_progress.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "training_progress.png")
 
-    # interativo: loss
-    px.line(history_df, x="epoch", y="train_loss", markers=True,
-            title="Training Loss").write_html(output_dir / "loss.html")
+    # interativo: progresso de treinamento (2×3 subplots)
+    epochs_list = list(epochs_ax)
+    fig_tp = make_subplots(
+        rows=2, cols=3,
+        subplot_titles=[
+            "Training Loss", "ROC-AUC por Época", "F1 por Época",
+            "Sensibilidade por Época", "Especificidade por Época", "",
+        ],
+        vertical_spacing=0.18,
+        horizontal_spacing=0.08,
+    )
+
+    # --- Loss (1,1) ---
+    fig_tp.add_trace(go.Scatter(
+        x=epochs_list, y=losses, mode="lines+markers",
+        name="Loss (Treino)", line=dict(color="red"),
+    ), row=1, col=1)
+
+    # --- AUC (1,2) ---
+    if has_tr:
+        fig_tp.add_trace(go.Scatter(
+            x=epochs_list, y=tr_aucs, mode="lines+markers",
+            name="AUC (Treino)", line=dict(color="red"),
+            legendgroup="treino", showlegend=True,
+        ), row=1, col=2)
+    fig_tp.add_trace(go.Scatter(
+        x=epochs_list, y=val_aucs, mode="lines+markers",
+        name="AUC (Val)", line=dict(color="blue"),
+        legendgroup="val", showlegend=True,
+    ), row=1, col=2)
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("roc_auc")
+        if _v is not None and np.isfinite(_v):
+            fig_tp.add_hline(y=_v, line_dash="dash", line_color="orange",
+                             annotation_text=f"Teste AUC={_v:.3f}",
+                             annotation_position="top right", row=1, col=2)
+
+    # --- F1 (1,3) ---
+    if has_tr:
+        fig_tp.add_trace(go.Scatter(
+            x=epochs_list, y=tr_f1s, mode="lines+markers",
+            name="F1 (Treino)", line=dict(color="red"),
+            legendgroup="treino", showlegend=False,
+        ), row=1, col=3)
+    fig_tp.add_trace(go.Scatter(
+        x=epochs_list, y=val_f1s, mode="lines+markers",
+        name="F1 (Val)", line=dict(color="green"),
+        legendgroup="val", showlegend=False,
+    ), row=1, col=3)
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("f1")
+        if _v is not None and np.isfinite(_v):
+            fig_tp.add_hline(y=_v, line_dash="dash", line_color="orange",
+                             annotation_text=f"Teste F1={_v:.3f}",
+                             annotation_position="top right", row=1, col=3)
+
+    # --- Sensibilidade (2,1) ---
+    if has_tr:
+        fig_tp.add_trace(go.Scatter(
+            x=epochs_list, y=tr_senss, mode="lines+markers",
+            name="Sens. (Treino)", line=dict(color="red"),
+            legendgroup="treino", showlegend=False,
+        ), row=2, col=1)
+    fig_tp.add_trace(go.Scatter(
+        x=epochs_list, y=val_senss, mode="lines+markers",
+        name="Sens. (Val)", line=dict(color="purple"),
+        legendgroup="val", showlegend=False,
+    ), row=2, col=1)
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("sensitivity_recall")
+        if _v is not None and np.isfinite(_v):
+            fig_tp.add_hline(y=_v, line_dash="dash", line_color="orange",
+                             annotation_text=f"Teste Sens={_v:.3f}",
+                             annotation_position="top right", row=2, col=1)
+
+    # --- Especificidade (2,2) ---
+    if has_tr:
+        fig_tp.add_trace(go.Scatter(
+            x=epochs_list, y=tr_specs, mode="lines+markers",
+            name="Spec. (Treino)", line=dict(color="red"),
+            legendgroup="treino", showlegend=False,
+        ), row=2, col=2)
+    fig_tp.add_trace(go.Scatter(
+        x=epochs_list, y=val_specs, mode="lines+markers",
+        name="Spec. (Val)", line=dict(color="cyan"),
+        legendgroup="val", showlegend=False,
+    ), row=2, col=2)
+    if results and "test" in results:
+        _v = results["test"]["case_level"].get("specificity")
+        if _v is not None and np.isfinite(_v):
+            fig_tp.add_hline(y=_v, line_dash="dash", line_color="orange",
+                             annotation_text=f"Teste Spec={_v:.3f}",
+                             annotation_position="top right", row=2, col=2)
+
+    fig_tp.update_layout(
+        title="Progresso de Treinamento — Treino / Validação / Teste (linha pontilhada)",
+        height=700,
+        showlegend=True,
+    )
+    fig_tp.write_html(output_dir / "training_progress.html")
 
     if len(np.unique(case_targets)) < 2:
         return   # sem métricas de ranking sem ambas as classes
+
+    has_val = (val_targets is not None and val_probs is not None
+               and len(np.unique(val_targets)) == 2)
 
     # --- ROC ---
     fpr, tpr, _ = roc_curve(case_targets, case_probabilities)
     roc_auc = auc(fpr, tpr)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(fpr, tpr, linewidth=2, label=f"AUC = {roc_auc:.3f}")
-    ax.plot([0, 1], [0, 1], "--", color="gray")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.plot([0, 1], [0, 1], "--", color="gray", label="Random")
+    if has_val:
+        fpr_v, tpr_v, _ = roc_curve(val_targets, val_probs)
+        roc_auc_v = auc(fpr_v, tpr_v)
+        ax.plot(fpr_v, tpr_v, linewidth=2, color="tab:blue", label=f"Validação (AUC = {roc_auc_v:.3f})")
+    ax.plot(fpr, tpr, linewidth=2, color="tab:orange", label=f"Teste (AUC = {roc_auc:.3f})")
     ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
-    ax.set_title("ROC Curve"); ax.legend(); ax.grid(True)
+    ax.set_title("ROC Curve — Validação vs Teste"); ax.legend(); ax.grid(True)
     plt.tight_layout()
     plt.savefig(output_dir / "roc_curve.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "roc_curve.png")
 
-    fig_roc = go.Figure([
-        go.Scatter(x=fpr.tolist(), y=tpr.tolist(), mode="lines",
-                   name=f"ROC (AUC={roc_auc:.3f})"),
-        go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
-                   line=dict(dash="dash"), name="Random"),
-    ])
-    fig_roc.update_layout(title=f"ROC Curve (AUC={roc_auc:.3f})",
+    fig_roc = go.Figure([go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
+                                    line=dict(dash="dash"), name="Random")])
+    if has_val:
+        fig_roc.add_trace(go.Scatter(x=fpr_v.tolist(), y=tpr_v.tolist(), mode="lines",
+                                     name=f"Validação (AUC={roc_auc_v:.3f})"))
+    fig_roc.add_trace(go.Scatter(x=fpr.tolist(), y=tpr.tolist(), mode="lines",
+                                 name=f"Teste (AUC={roc_auc:.3f})"))
+    fig_roc.update_layout(title="ROC Curve — Validação vs Teste",
                           xaxis_title="FPR", yaxis_title="TPR")
     fig_roc.write_html(output_dir / "roc_curve.html")
 
@@ -2498,47 +2003,69 @@ def generate_plots(
     precision, recall, _ = precision_recall_curve(case_targets, case_probabilities)
     ap = average_precision_score(case_targets, case_probabilities)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot(recall, precision, linewidth=2, label=f"AP = {ap:.3f}")
+    fig, ax = plt.subplots(figsize=(7, 6))
+    if has_val:
+        precision_v, recall_v, _ = precision_recall_curve(val_targets, val_probs)
+        ap_v = average_precision_score(val_targets, val_probs)
+        ax.plot(recall_v, precision_v, linewidth=2, color="tab:blue", label=f"Validação (AP = {ap_v:.3f})")
+    ax.plot(recall, precision, linewidth=2, color="tab:orange", label=f"Teste (AP = {ap:.3f})")
     ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
-    ax.set_title("Precision-Recall Curve"); ax.legend(); ax.grid(True)
+    ax.set_title("Precision-Recall Curve — Validação vs Teste"); ax.legend(); ax.grid(True)
     plt.tight_layout()
     plt.savefig(output_dir / "precision_recall.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "precision_recall.png")
 
-    go.Figure([go.Scatter(x=recall.tolist(), y=precision.tolist(), mode="lines",
-                          name=f"AP={ap:.3f}")]).update_layout(
-        title="Precision-Recall Curve", xaxis_title="Recall", yaxis_title="Precision"
-    ).write_html(output_dir / "precision_recall.html")
+    fig_pr = go.Figure()
+    if has_val:
+        fig_pr.add_trace(go.Scatter(x=recall_v.tolist(), y=precision_v.tolist(), mode="lines",
+                                    name=f"Validação (AP={ap_v:.3f})"))
+    fig_pr.add_trace(go.Scatter(x=recall.tolist(), y=precision.tolist(), mode="lines",
+                                name=f"Teste (AP={ap:.3f})"))
+    fig_pr.update_layout(title="Precision-Recall Curve — Validação vs Teste",
+                         xaxis_title="Recall", yaxis_title="Precision")
+    fig_pr.write_html(output_dir / "precision_recall.html")
 
     # --- Confusion Matrix ---
     preds_bin = (case_probabilities >= threshold).astype(int)
-    cm = confusion_matrix(case_targets, preds_bin)
+    cm_test = confusion_matrix(case_targets, preds_bin)
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(cm, cmap="Blues")
-    plt.colorbar(im, ax=ax)
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
-                    color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=14)
-    ax.set_xticks([0, 1]); ax.set_xticklabels(["Negativo", "Positivo"])
-    ax.set_yticks([0, 1]); ax.set_yticklabels(["Negativo", "Positivo"])
-    ax.set_xlabel("Predito"); ax.set_ylabel("Real"); ax.set_title("Confusion Matrix")
+    def _draw_cm(ax, cm, title):
+        im = ax.imshow(cm, cmap="Blues")
+        plt.colorbar(im, ax=ax)
+        for i in range(cm.shape[0]):
+            for j in range(cm.shape[1]):
+                ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                        color="white" if cm[i, j] > cm.max() / 2 else "black", fontsize=14)
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["Negativo", "Positivo"])
+        ax.set_yticks([0, 1]); ax.set_yticklabels(["Negativo", "Positivo"])
+        ax.set_xlabel("Predito"); ax.set_ylabel("Real"); ax.set_title(title)
+
+    if has_val:
+        val_preds_bin = (val_probs >= threshold).astype(int)
+        cm_val = confusion_matrix(val_targets, val_preds_bin)
+        fig, axes_cm = plt.subplots(1, 2, figsize=(12, 5))
+        _draw_cm(axes_cm[0], cm_val,  "Confusion Matrix — Validação")
+        _draw_cm(axes_cm[1], cm_test, "Confusion Matrix — Teste")
+        plt.suptitle("Confusion Matrix — Validação vs Teste", fontsize=14)
+    else:
+        fig, ax_cm = plt.subplots(figsize=(6, 5))
+        _draw_cm(ax_cm, cm_test, "Confusion Matrix — Teste")
     plt.tight_layout()
     plt.savefig(output_dir / "confusion_matrix.png", dpi=200)
+    plt.show()
     plt.close()
-    _show_png_terminal(output_dir / "confusion_matrix.png")
-    px.imshow(cm, text_auto=True, labels=dict(x="Predito", y="Real"),
+    px.imshow(cm_test, text_auto=True, labels=dict(x="Predito", y="Real"),
               x=["Negativo", "Positivo"], y=["Negativo", "Positivo"],
-              title="Confusion Matrix").write_html(output_dir / "confusion_matrix.html")
+              title="Confusion Matrix — Teste").write_html(output_dir / "confusion_matrix.html")
 
     # --- Calibração ---
-    plot_calibration_curve(case_targets, case_probabilities, output_dir)
+    plot_calibration_curve(case_targets, case_probabilities, output_dir,
+                           val_targets if has_val else None, val_probs if has_val else None)
 
     # --- Threshold sweep ---
-    plot_threshold_sweep(case_targets, case_probabilities, threshold, output_dir)
+    plot_threshold_sweep(case_targets, case_probabilities, threshold, output_dir,
+                         val_targets if has_val else None, val_probs if has_val else None)
 
     # --- Dashboard de métricas: validação vs teste ---
     if results is not None and "val" in results and "test" in results:
@@ -2560,8 +2087,8 @@ def generate_plots(
         plt.tight_layout()
         plt.savefig(output_dir / "metrics_dashboard.png", dpi=200)
         plt.savefig('comparacao_acuracia.png', dpi=150, bbox_inches='tight')
+        plt.show()
         plt.close()
-        _show_png_terminal(output_dir / "metrics_dashboard.png")
 
         # interativo
         fig_bar = go.Figure([
@@ -2582,11 +2109,7 @@ def _calibrate_temperature(
     val_loader: DataLoader,
     device: torch.device,
 ) -> float:
-    """
-    Otimiza escalar de temperatura T no conjunto de validação via LBFGS,
-    minimizando NLL. T > 1 suaviza probabilidades (reduz overconfidence).
-    Retorna T (float). Não modifica o modelo.
-    """
+    
     model.eval()
     logits_list, targets_list = [], []
     with torch.no_grad():
@@ -2626,68 +2149,42 @@ def train_model(
     pretrained: bool = True,
     image_size: int = 384,
     batch_size: int = 16,
-    epochs: int = 70,
+    epochs: int = 30,
     freeze_backbone_epochs: int = 5,
-    patience: int = 30,
+    patience: int = 20,
     learning_rate: float = 3e-4,
     weight_decay: float = 0.01,
     mixup_alpha: float = 0.4,
-    cutmix_alpha: float = 1.0,
     loss_type: str = "focal",
-    pos_weight_multiplier: float = 2.0,
+    pos_weight_multiplier: float = 1.5,
     temperature_scaling: bool = True,
     fixed_threshold: float | None = None,
     bootstrap_iterations: int = 500,
     device_name: str = "auto",
     seed: int = 42,
-    use_sam: bool = True,
-    use_swa: bool = True,
-    swa_start_frac: float = 0.6,
-    use_weighted_sampler: bool = True,
-    accumulation_steps: int = 1,
-    progressive_resize: bool = False,
-    tta_scales: list[int] | None = None,
-    pretrained_backbone_path: str | Path | None = None,
 ) -> dict[str, Any]:
     set_seed(seed)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.enabled = True
     manifest = load_manifest(manifest_path)
     output_dir = ensure_dir(output_dir)
-    nw = 2 if torch.cuda.is_available() else 0
-
-    # Progressive resize: fases (fração acumulada do total de épocas, tamanho em px)
-    # Fase 1 — 30% das épocas a 224px (warm-up rápido, batch maior possível)
-    # Fase 2 — 35% das épocas a 320px (escala intermediária)
-    # Fase 3 — 35% das épocas a image_size (tamanho final, default 384)
-    if progressive_resize:
-        _resize_schedule = [
-            (int(epochs * 0.30), 224),
-            (int(epochs * 0.65), 320),
-            (epochs,             image_size),
-        ]
-        _current_size = 224
-        print(f"  Progressive resize: 224px ({int(epochs*0.30)} epocas) -> "
-              f"320px ({int(epochs*0.35)} epocas) -> {image_size}px ({int(epochs*0.35)} epocas)")
-    else:
-        _resize_schedule = [(epochs, image_size)]
-        _current_size = image_size
-
-    loaders = create_dataloaders(manifest, image_root, _current_size, batch_size,
-                                 num_workers=nw, use_weighted_sampler=use_weighted_sampler)
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    nw = 2 * max(n_gpus, 1) if n_gpus > 0 else 0
+    loaders = create_dataloaders(manifest, image_root, image_size, batch_size, num_workers=nw)
     if "train" not in loaders or "val" not in loaders:
         raise ValueError("Manifesto deve conter splits train e val.")
 
     device = select_device(device_name)
     print(f"Dispositivo: {device} | Arquitetura: {architecture} | pretrained={pretrained}")
     if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
+        for i in range(n_gpus):
             print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+    if n_gpus > 1:
+        print(f"  Aviso: nn.DataParallel incompatível com PyTorch/Python 3.14 nesta versão — treinando em GPU 0.")
 
-    model = build_model(
-        architecture, pretrained=pretrained, dropout=0.40,
-        pretrained_backbone_path=pretrained_backbone_path,
-    ).to(device)
-    model = _wrap_dataparallel(model, device)
-    base_model = _get_base_module(model)
+    base_model = build_model(architecture, pretrained=pretrained, dropout=0.40).to(device)
+    model = base_model
 
     # Peso de classe positiva para imbalance
     train_cases = manifest[manifest["split"] == "train"].drop_duplicates("patient_id")
@@ -2701,10 +2198,7 @@ def train_model(
 
     pw_tensor = torch.tensor([positive_weight], device=device)
     if loss_type == "focal":
-        criterion = FocalLoss(gamma=2.5, pos_weight=pw_tensor, smooth=0.05)
-    elif loss_type == "asymmetric":
-        criterion = AsymmetricLoss(gamma_neg=4.0, gamma_pos=0.0, clip=0.05,
-                                   pos_weight=pw_tensor)
+        criterion = FocalLoss(gamma=2.0, pos_weight=pw_tensor)
     else:
         criterion = LabelSmoothingBCE(smoothing=0.05, pos_weight=pw_tensor)
 
@@ -2714,83 +2208,55 @@ def train_model(
                            + list(base_model.layer2.parameters()) + list(base_model.layer3.parameters())
                            + list(base_model.layer4.parameters()))
         head_params = list(base_model.fc.parameters())
-    elif architecture in ("convnext_tiny", "convnext_small"):
+    elif architecture == "convnext_tiny":
         backbone_params = list(base_model.features.parameters())
         head_params = list(base_model.classifier.parameters())
-    else:  # efficientnet_b3 / b4 / b5
+    else:  # efficientnet_b3 / efficientnet_b4
         backbone_params = list(base_model.features.parameters())
         head_params = list(base_model.classifier.parameters())
 
-    param_groups = [
-        {"params": backbone_params, "lr": learning_rate * 0.1},
-        {"params": head_params,     "lr": learning_rate},
-    ]
-    if use_sam:
-        optimizer = SAM(param_groups, AdamW, rho=0.05, weight_decay=weight_decay)
-        print("  Optimizer: SAM(AdamW) — mínimos planos, 2 forward passes/batch")
-    else:
-        optimizer = AdamW(param_groups, weight_decay=weight_decay)
-
-    # CosineAnnealingWarmRestarts: T_0=10, T_mult=2 → reinicia em 10, 30, 70...
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer if not use_sam else optimizer.base_optimizer,
-        T_0=10, T_mult=2, eta_min=1e-6,
+    optimizer = AdamW(
+        [
+            {"params": backbone_params, "lr": learning_rate * 0.1},
+            {"params": head_params,     "lr": learning_rate},
+        ],
+        weight_decay=weight_decay,
     )
 
-    # SWA: inicia na fração swa_start_frac do treino
-    swa_start = max(int(epochs * swa_start_frac), freeze_backbone_epochs + 1)
-    if use_swa:
-        from torch.optim.swa_utils import AveragedModel, SWALR
-        swa_model     = AveragedModel(model)
-        swa_scheduler = SWALR(optimizer if not use_sam else optimizer.base_optimizer,
-                              swa_lr=1e-5)
-        print(f"  SWA: ativo a partir da época {swa_start}")
-    swa_active = False
+    # CosineAnnealingWarmRestarts: T_0=10, T_mult=2 → reinicia em 10, 30, ...
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6,
+    )
+
+    # Loader de treino com transforms de avaliação (sem augmentação) para métricas por época
+    train_eval_ds = CervixImageDataset(
+        manifest[manifest["split"] == "train"].copy(),
+        image_root=image_root,
+        transform=build_transforms(image_size)["eval"],
+    )
+    train_eval_loader = DataLoader(
+        train_eval_ds, batch_size=batch_size, shuffle=False,
+        num_workers=nw, pin_memory=torch.cuda.is_available(),
+    )
 
     best_score = -np.inf
     best_model_auc = float("nan")
     best_threshold = fixed_threshold if fixed_threshold is not None else 0.5
-    best_state = copy.deepcopy(model.state_dict())
+    best_state = copy.deepcopy(base_model.state_dict())
     epochs_without_improvement = 0
     best_epoch: int | None = None
     history: list[dict[str, Any]] = []
     started = time.time()
 
-    _next_resize_idx = 0  # índice na _resize_schedule
-
     for epoch in range(epochs):
-        # Progressive resize: verifica se deve trocar de fase
-        if progressive_resize:
-            phase_end, phase_size = _resize_schedule[_next_resize_idx]
-            if epoch == 0 or (epoch > 0 and _current_size != phase_size):
-                if epoch < phase_end:
-                    pass  # já na fase certa
-                else:
-                    _next_resize_idx = min(_next_resize_idx + 1, len(_resize_schedule) - 1)
-                    phase_end, phase_size = _resize_schedule[_next_resize_idx]
-            if phase_size != _current_size:
-                _current_size = phase_size
-                loaders = create_dataloaders(
-                    manifest, image_root, _current_size, batch_size,
-                    num_workers=nw, use_weighted_sampler=use_weighted_sampler)
-                print(f"  [resize] Fase nova: {_current_size}px na época {epoch + 1}")
-
         set_backbone_trainable(base_model, architecture, epoch >= freeze_backbone_epochs)
 
         train_loss = train_epoch(
             model, loaders["train"], criterion, optimizer, device,
             epoch, epochs, mixup_alpha=mixup_alpha,
-            cutmix_alpha=cutmix_alpha, use_sam=use_sam,
-            accumulation_steps=accumulation_steps,
         )
 
-        # SWA: acumular pesos a partir de swa_start
-        if use_swa and epoch >= swa_start:
-            swa_model.update_parameters(model)
-            swa_scheduler.step()
-            swa_active = True
-
-        pred = predict_loader(model, loaders["val"], device, tta_scales=tta_scales)
+        pred = predict_loader(model, loaders["val"], device)
         _, c_tgt, c_prob = aggregate_case_predictions(
             pred["patient_ids"], pred["targets"], pred["probabilities"])
         if fixed_threshold is not None:
@@ -2799,38 +2265,46 @@ def train_model(
             opt_threshold, threshold_score = optimize_threshold(c_tgt, c_prob)
         val_m = binary_metrics(c_tgt, c_prob, opt_threshold)
 
+        # Métricas do conjunto de treino (eval mode, sem TTA, sem augmentação)
+        pred_tr = predict_loader_simple(model, train_eval_loader, device)
+        _, tr_c_tgt, tr_c_prob = aggregate_case_predictions(
+            pred_tr["patient_ids"], pred_tr["targets"], pred_tr["probabilities"])
+        train_m = binary_metrics(tr_c_tgt, tr_c_prob, opt_threshold)
+
         scheduler.step(epoch + 1)
         current_lr = optimizer.param_groups[-1]["lr"]
 
         print(
-            f"Epoch {epoch + 1:03d}/{epochs} | Loss={train_loss:.4f} | "
-            f"AUC={val_m['roc_auc']:.4f} | F1={val_m['f1']:.4f} | "
-            f"Sens={val_m['sensitivity_recall']:.4f} | Spec={val_m['specificity']:.4f} | "
+            f"Epoch {epoch + 1:03d}/{epochs} | "
+            f"Loss={train_loss:.4f} | "
+            f"trAUC={train_m['roc_auc']:.4f} trF1={train_m['f1']:.4f} | "
+            f"valAUC={val_m['roc_auc']:.4f} valF1={val_m['f1']:.4f} | "
+            f"Sens={val_m['sensitivity_recall']:.4f} Spec={val_m['specificity']:.4f} | "
             f"LR={current_lr:.2e}"
         )
 
         history.append({
             "epoch": epoch + 1,
             "train_loss": train_loss,
+            "train_case_metrics": train_m,
             "threshold": float(opt_threshold),
             "threshold_score": float(threshold_score),
             "val_case_metrics": val_m,
         })
 
-        # Score orientado a contexto médico: Sensibilidade tem peso máximo
-        # (FN = cancer não detectado = pior desfecho clínico)
+        # Score balanceado: AUC + F1 + balanced_accuracy
+        
         selection_score = (
-            0.35 * val_m["roc_auc"]
-            + 0.35 * val_m["sensitivity_recall"]
-            + 0.20 * val_m["f1"]
-            + 0.10 * val_m["specificity"]
+            0.5 * val_m["roc_auc"]
+            + 0.3 * val_m["f1"]
+            + 0.2 * val_m["balanced_accuracy"]
         )
 
         if selection_score > best_score:
             best_score = selection_score
             best_model_auc = val_m["roc_auc"]
             best_threshold = opt_threshold
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(base_model.state_dict())
             epochs_without_improvement = 0
             best_epoch = epoch + 1
         else:
@@ -2839,26 +2313,18 @@ def train_model(
                 print(f"Early stopping na época {epoch + 1}.")
                 break
 
-    model.load_state_dict(best_state)
-
-    # SWA: finalizar — atualizar batch norms e substituir modelo
-    if use_swa and swa_active:
-        print("  SWA: atualizando batch norms...")
-        from torch.optim.swa_utils import update_bn
-        update_bn(loaders["train"], swa_model, device=device)
-        model = swa_model.module if hasattr(swa_model, "module") else swa_model
-        print("  SWA: modelo médio ativado para avaliação")
+    base_model.load_state_dict(best_state)
 
     # Temperature scaling: calibração pós-treino no conjunto de validação
     temperature = 1.0
     if temperature_scaling:
         try:
-            temperature = _calibrate_temperature(model, loaders["val"], device)
+            temperature = _calibrate_temperature(base_model, loaders["val"], device)
         except Exception as e:
             print(f"  Aviso: temperature scaling falhou ({e}), usando T=1.0")
 
     checkpoint = {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": base_model.state_dict(),
         "architecture": architecture,
         "dropout": 0.40,
         "image_size": image_size,
@@ -2881,12 +2347,20 @@ def train_model(
     test_ids, test_targets, test_probs = aggregate_case_predictions(
         pred_test["patient_ids"], pred_test["targets"], pred_test["probabilities"])
 
-    generate_plots(history, test_targets, test_probs, output_dir, best_threshold, results)
+    val_targets_plot: np.ndarray | None = None
+    val_probs_plot: np.ndarray | None = None
+    if "val" in loaders:
+        pred_val = predict_loader(model, loaders["val"], device, temperature=temperature)
+        _, val_targets_plot, val_probs_plot = aggregate_case_predictions(
+            pred_val["patient_ids"], pred_val["targets"], pred_val["probabilities"])
+
+    generate_plots(history, test_targets, test_probs, output_dir, best_threshold, results,
+                   val_targets=val_targets_plot, val_probs=val_probs_plot)
 
     # GradCAM: painel de exemplares (TP/TN/FP/FN)
     exemplar_dir = ensure_dir(output_dir / "gradcam")
     generate_gradcam_exemplars(
-        model=model,
+        model=base_model,
         manifest=manifest,
         image_root=Path(image_root),
         image_size=image_size,
@@ -2901,7 +2375,7 @@ def train_model(
 
     # GradCAM: todas as imagens do dataset
     generate_gradcam_dataset(
-        model=model,
+        model=base_model,
         manifest=manifest,
         image_root=image_root,
         image_size=image_size,
@@ -2956,9 +2430,7 @@ def evaluate_checkpoint(
     bootstrap_iterations: int = 500,
     device_name: str = "auto",
     seed: int = 42,
-    tta_scales: list[int] | None = None,
 ) -> dict[str, Any]:
-    output_dir = ensure_dir(output_dir)
     model, ckpt, device = load_checkpoint_model(checkpoint_path, device_name)
     manifest = load_manifest(manifest_path)
     loaders = create_dataloaders(
@@ -2969,7 +2441,6 @@ def evaluate_checkpoint(
         model, loaders, device, float(ckpt.get("threshold", 0.50)),
         output_dir, manifest, bootstrap_iterations, seed,
         temperature=float(ckpt.get("temperature", 1.0)),
-        tta_scales=tta_scales,
     )
     summary = {"checkpoint": str(checkpoint_path), "device": str(device), "results": results}
     write_json(output_dir / "checkpoint_evaluation_summary.json", summary)
@@ -3022,115 +2493,13 @@ def run_demo(zip_path: str | Path, data_dir: str | Path,
         pretrained=True,
         image_size=384,
         batch_size=8,
-        epochs=70,
+        epochs=30,
         freeze_backbone_epochs=5,
-        patience=30,
+        patience=15,
         bootstrap_iterations=500,
         device_name="auto",
         seed=seed,
     )
-
-
-def train_kfold(
-    manifest_path: str | Path = DEFAULT_MANIFEST,
-    image_root: str | Path = DEFAULT_DATA_DIR,
-    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
-    n_splits: int = 5,
-    **train_kwargs,
-) -> dict[str, Any]:
-    """Treino com K-Fold estratificado (K=5 padrão).
-
-    O conjunto de teste (split='test') é mantido fora de todos os folds.
-    Para cada fold, as amostras de treino+val são reparticionadas: K-1 folds
-    viram treino, 1 fold vira val.  As predições de teste são a média geométrica
-    das K probabilidades (ensemble grátis).
-
-    Retorna métricas consolidadas do ensemble no conjunto de teste.
-    """
-    from sklearn.model_selection import StratifiedKFold
-
-    output_dir = ensure_dir(output_dir)
-    manifest   = load_manifest(manifest_path)
-
-    # Separa teste (intocável) de train+val
-    test_df     = manifest[manifest["split"] == "test"].copy()
-    trainval_df = manifest[manifest["split"].isin(["train", "val"])].copy()
-
-    # Estratifica por paciente (uma linha por paciente)
-    pat_df = trainval_df.drop_duplicates("patient_id")[["patient_id", "target"]].reset_index(drop=True)
-    skf    = StratifiedKFold(n_splits=n_splits, shuffle=True,
-                              random_state=train_kwargs.pop("seed", 42))
-
-    fold_test_probs: list[np.ndarray] = []
-    fold_results:    list[dict] = []
-
-    for fold, (train_idx, val_idx) in enumerate(skf.split(pat_df, pat_df["target"])):
-        fold_dir = ensure_dir(output_dir / f"fold_{fold + 1}")
-        print(f"\n{'='*60}")
-        print(f"  K-FOLD — Fold {fold + 1}/{n_splits}")
-        print(f"{'='*60}")
-
-        train_pids = set(pat_df.iloc[train_idx]["patient_id"])
-        val_pids   = set(pat_df.iloc[val_idx]["patient_id"])
-
-        fold_manifest = manifest.copy()
-        fold_manifest.loc[fold_manifest["patient_id"].isin(train_pids), "split"] = "train"
-        fold_manifest.loc[fold_manifest["patient_id"].isin(val_pids),   "split"] = "val"
-        fold_manifest.loc[fold_manifest["split"] == "test", "split"] = "test"
-
-        # Salva manifesto do fold temporariamente
-        fold_manifest_path = fold_dir / "manifest_fold.csv"
-        fold_manifest.to_csv(fold_manifest_path, index=False)
-
-        result = train_model(
-            manifest_path=fold_manifest_path,
-            image_root=image_root,
-            output_dir=fold_dir,
-            seed=fold,  # seed diferente por fold
-            **train_kwargs,
-        )
-        fold_results.append(result)
-
-        # Predições do fold no conjunto de teste
-        ckpt   = torch.load(fold_dir / "best_model.pt", map_location="cpu", weights_only=True)
-        device = select_device(train_kwargs.get("device_name", "auto"))
-        model  = build_model(ckpt["architecture"], pretrained=False,
-                             dropout=float(ckpt.get("dropout", 0.4))).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        nw     = 2 if torch.cuda.is_available() else 0
-        image_size = int(ckpt.get("image_size", 384))
-        test_loader = create_dataloaders(
-            test_df.assign(split="test"), image_root, image_size,
-            batch_size=train_kwargs.get("batch_size", 8), num_workers=nw,
-            use_weighted_sampler=False,
-        ).get("test")
-        if test_loader:
-            pred = predict_loader(model, test_loader, device,
-                                  temperature=float(ckpt.get("temperature", 1.0)))
-            fold_test_probs.append(pred["probabilities"])
-            test_targets = pred["targets"]
-
-    if not fold_test_probs:
-        raise RuntimeError("Nenhuma predição de teste foi gerada.")
-
-    # Ensemble: média geométrica das probabilidades dos K folds
-    log_sum    = sum(np.log(np.clip(p, 1e-7, 1 - 1e-7)) for p in fold_test_probs)
-    ens_probs  = np.exp(log_sum / len(fold_test_probs))
-    ids, c_tgt, c_prob = aggregate_case_predictions(
-        pred["patient_ids"], test_targets, ens_probs)
-
-    threshold, _ = optimize_threshold(c_tgt, c_prob)
-    ens_metrics  = binary_metrics(c_tgt, c_prob, threshold)
-
-    print(f"\n{'='*60}")
-    print(f"  ENSEMBLE K-FOLD ({n_splits} folds) — Teste")
-    print(f"  AUC={ens_metrics['roc_auc']:.4f} | F1={ens_metrics['f1']:.4f} | "
-          f"Sens={ens_metrics['sensitivity_recall']:.4f} | Spec={ens_metrics['specificity']:.4f}")
-    print(f"{'='*60}")
-
-    ensemble_result = {"ensemble_test_metrics": ens_metrics, "folds": fold_results}
-    write_json(output_dir / "kfold_summary.json", ensemble_result)
-    return ensemble_result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3155,24 +2524,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--image-root",       default=str(DEFAULT_DATA_DIR))
     p.add_argument("--output-dir",       default=str(DEFAULT_OUTPUT_DIR))
     p.add_argument("--architecture",
-                   choices=["resnet34", "efficientnet_b3", "efficientnet_b4",
-                            "efficientnet_b5", "convnext_tiny", "convnext_small"],
+                   choices=["resnet34", "efficientnet_b3", "efficientnet_b4", "convnext_tiny"],
                    default="efficientnet_b3")
     p.add_argument("--no-pretrained",    action="store_true")
     p.add_argument("--image-size",       type=int,   default=384)
     p.add_argument("--batch-size",       type=int,   default=8)
-    p.add_argument("--epochs",           type=int,   default=70)
+    p.add_argument("--epochs",           type=int,   default=30)
     p.add_argument("--freeze-epochs",    type=int,   default=5)
-    p.add_argument("--patience",         type=int,   default=30)
+    p.add_argument("--patience",         type=int,   default=20)
     p.add_argument("--lr",               type=float, default=3e-4)
     p.add_argument("--weight-decay",     type=float, default=0.01)
     p.add_argument("--mixup-alpha",      type=float, default=0.4)
-    p.add_argument("--cutmix-alpha",     type=float, default=1.0,
-                   help="Alpha do CutMix (0=desativado). Alterna 50/50 com MixUp.")
-    p.add_argument("--loss-type",        choices=["focal", "label_smoothing", "asymmetric"],
-                   default="focal")
-    p.add_argument("--pos-weight-mult",  type=float, default=2.0,
-                   help="Multiplicador do peso da classe positiva (padrão 2.0×)")
+    p.add_argument("--loss-type",        choices=["focal", "label_smoothing"], default="focal")
+    p.add_argument("--pos-weight-mult",  type=float, default=1.5,
+                   help="Multiplicador do peso da classe positiva (padrão 1.5×)")
     p.add_argument("--no-temp-scaling",  action="store_true",
                    help="Desativa temperature scaling pós-treino")
     p.add_argument("--threshold",        type=float, default=None,
@@ -3180,88 +2545,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bootstrap",        type=int,   default=500)
     p.add_argument("--device",           default="auto")
     p.add_argument("--seed",             type=int,   default=42)
-    p.add_argument("--no-sam",           action="store_true",
-                   help="Desativa SAM optimizer (usa AdamW puro, ~30%% mais rapido)")
-    p.add_argument("--no-swa",           action="store_true",
-                   help="Desativa Stochastic Weight Averaging")
-    p.add_argument("--swa-start",        type=float, default=0.6,
-                   help="Fração do treino onde SWA começa (padrão 0.6 = 60%%)")
-    p.add_argument("--no-weighted-sampler", action="store_true",
-                   help="Desativa WeightedRandomSampler no DataLoader de treino")
-    p.add_argument("--accumulation-steps", type=int, default=1,
-                   help="Gradient accumulation: acumula N batches antes de optimizer.step() "
-                        "(desativado automaticamente com SAM). Ex: 4 -> batch efetivo 4x")
-    p.add_argument("--progressive-resize", action="store_true",
-                   help="Treina em 224px (30%%) -> 320px (35%%) -> image-size (35%%) "
-                        "para melhor generalização em datasets pequenos")
-    p.add_argument("--tta-scales", type=int, nargs="+", default=None,
-                   metavar="SIZE",
-                   help="Escalas para TTA multi-escala. Ex: --tta-scales 320 384 456 "
-                        "(padrão: só o tamanho nativo)")
-    p.add_argument("--pretrained-backbone", default=None,
-                   metavar="PATH",
-                   help="Backbone pre-treinado no Intel dataset. "
-                        "Ex: --pretrained-backbone outputs/arquivo_unico/pretrain_backbone.pt")
-    # --- Pre-treino integrado (Intel & MobileODT) ---
-    p.add_argument("--with-pretrain", action="store_true",
-                   help="Executa pre-treino no Intel & MobileODT antes do treino IARC "
-                        "(faz as 2 fases automaticamente num unico comando)")
-    p.add_argument("--intel-zip",             default=str(DEFAULT_INTEL_ZIP),
-                   metavar="PATH",
-                   help="ZIP do Intel & MobileODT (usado com --with-pretrain)")
-    p.add_argument("--intel-data-dir",        default=str(DEFAULT_INTEL_DATA_DIR),
-                   metavar="DIR",
-                   help="Diretorio de extracao Intel (usado com --with-pretrain)")
-    p.add_argument("--pretrain-output",       default=str(DEFAULT_INTEL_PRETRAIN),
-                   metavar="PATH",
-                   help="Onde salvar pretrain_backbone.pt (usado com --with-pretrain)")
-    p.add_argument("--pretrain-epochs",       type=int, default=30,
-                   help="Epocas de pre-treino Intel (padrao 30)")
-    p.add_argument("--pretrain-batch-size",   type=int, default=8,
-                   help="Batch size do pre-treino Intel (padrao 8)")
-    p.add_argument("--pretrain-freeze-epochs",type=int, default=3,
-                   help="Epocas com backbone frozen no pre-treino (padrao 3)")
-    p.add_argument("--skip-intel-prepare",    action="store_true",
-                   help="Pular extracao do ZIP Intel (usa intel_manifest.csv ja existente)")
-
-    p = sub.add_parser("pretrain", help="Pre-treina backbone no Intel & MobileODT (3 classes).")
-    p.add_argument("--zip",          default=str(DEFAULT_INTEL_ZIP),
-                   help="ZIP do Intel & MobileODT Cervical Cancer Screening")
-    p.add_argument("--data-dir",     default=str(DEFAULT_INTEL_DATA_DIR))
-    p.add_argument("--output",       default=str(DEFAULT_INTEL_PRETRAIN))
-    p.add_argument("--architecture",
-                   choices=["efficientnet_b3", "efficientnet_b4",
-                            "convnext_tiny", "convnext_small"],
-                   default="efficientnet_b3")
-    p.add_argument("--image-size",   type=int,   default=224,
-                   help="Resolucao para pre-treino (padrao 224px — economiza VRAM; "
-                        "features aprendidas sao transferidas independente do tamanho)")
-    p.add_argument("--epochs",       type=int,   default=30,
-                   help="Epocas de pre-treino (padrao 30; mais nao melhora muito)")
-    p.add_argument("--batch-size",   type=int,   default=8,
-                   help="Batch size para pre-treino (padrao 8)")
-    p.add_argument("--lr",           type=float, default=3e-4)
-    p.add_argument("--freeze-epochs",type=int,   default=3,
-                   help="Epocas com backbone frozen (aquece cabeca antes do fine-tune)")
-    p.add_argument("--device",       default="auto")
-    p.add_argument("--seed",         type=int,   default=42)
-    p.add_argument("--skip-prepare", action="store_true",
-                   help="Pular extracao do ZIP (usa intel_manifest.csv ja existente)")
-
-    p = sub.add_parser("kfold", help="Treino K-Fold estratificado com ensemble.")
-    p.add_argument("--manifest",     default=str(DEFAULT_MANIFEST))
-    p.add_argument("--image-root",   default=str(DEFAULT_DATA_DIR))
-    p.add_argument("--output-dir",   default=str(DEFAULT_OUTPUT_DIR))
-    p.add_argument("--n-splits",     type=int,   default=5)
-    p.add_argument("--epochs",       type=int,   default=70)
-    p.add_argument("--batch-size",   type=int,   default=8)
-    p.add_argument("--lr",           type=float, default=3e-4)
-    p.add_argument("--loss-type",    choices=["focal", "label_smoothing", "asymmetric"],
-                   default="focal")
-    p.add_argument("--no-sam",       action="store_true")
-    p.add_argument("--no-swa",       action="store_true")
-    p.add_argument("--device",       default="auto")
-    p.add_argument("--seed",         type=int,   default=42)
 
     p = sub.add_parser("evaluate")
     p.add_argument("--checkpoint",  default=str(DEFAULT_CHECKPOINT))
@@ -3272,9 +2555,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bootstrap",   type=int, default=500)
     p.add_argument("--device",      default="auto")
     p.add_argument("--seed",        type=int, default=42)
-    p.add_argument("--tta-scales",  type=int, nargs="+", default=None,
-                   metavar="SIZE",
-                   help="TTA multi-escala. Ex: --tta-scales 320 384 456")
 
     p = sub.add_parser("predict")
     p.add_argument("--image",      required=True)
@@ -3298,72 +2578,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     if len(sys.argv) == 1:
-        # Pipeline completo automatico (nenhum argumento fornecido):
-        #   1. Prepara dataset IARC se o manifesto ainda nao existir
-        #   2. Pre-treina backbone no Intel & MobileODT
-        #   3. Treina classificador binario IARC com backbone pre-treinado
-        if not DEFAULT_MANIFEST.exists():
-            prepare_iarc_dataset()
-        intel_manifest = DEFAULT_INTEL_DATA_DIR / "intel_manifest.csv"
-        sys.argv += ["train", "--with-pretrain"]
-        if intel_manifest.exists():
-            sys.argv.append("--skip-intel-prepare")
+        sys.argv.append("train")
 
     args = build_parser().parse_args()
 
     if args.command == "prepare":
         prepare_iarc_dataset(args.zip_path, args.data_dir, args.seed)
-    elif args.command == "pretrain":
-        if not args.skip_prepare:
-            prepare_intel_dataset(args.zip, args.data_dir, seed=args.seed)
-        intel_manifest = str(Path(args.data_dir) / "intel_manifest.csv")
-        pretrain_backbone(
-            manifest_path=intel_manifest,
-            image_root=args.data_dir,
-            output_path=args.output,
-            architecture=args.architecture,
-            image_size=args.image_size,
-            batch_size=args.batch_size,
-            epochs=args.epochs,
-            learning_rate=args.lr,
-            freeze_epochs=args.freeze_epochs,
-            device_name=args.device,
-            seed=args.seed,
-        )
     elif args.command == "demo":
         run_demo(args.zip_path, args.data_dir, args.output_dir, args.seed)
     elif args.command == "train":
-        backbone_path = args.pretrained_backbone
-
-        if args.with_pretrain:
-            if backbone_path is not None:
-                print("[with-pretrain] --pretrained-backbone ja fornecido; "
-                      "pulando pre-treino Intel.")
-            else:
-                print("\n" + "=" * 60)
-                print("FASE 1/2  Pre-treino Intel & MobileODT")
-                print("=" * 60)
-                if not args.skip_intel_prepare:
-                    prepare_intel_dataset(args.intel_zip, args.intel_data_dir,
-                                          seed=args.seed)
-                intel_manifest = str(Path(args.intel_data_dir) / "intel_manifest.csv")
-                backbone_path = pretrain_backbone(
-                    manifest_path=intel_manifest,
-                    image_root=args.intel_data_dir,
-                    output_path=args.pretrain_output,
-                    architecture=args.architecture,
-                    image_size=224,
-                    batch_size=args.pretrain_batch_size,
-                    epochs=args.pretrain_epochs,
-                    learning_rate=args.lr,
-                    freeze_epochs=args.pretrain_freeze_epochs,
-                    device_name=args.device,
-                    seed=args.seed,
-                )
-                print("\n" + "=" * 60)
-                print("FASE 2/2  Treino IARC com backbone pre-treinado")
-                print("=" * 60)
-
         train_model(
             manifest_path=args.manifest,
             image_root=args.image_root,
@@ -3378,7 +2601,6 @@ def main() -> None:
             learning_rate=args.lr,
             weight_decay=args.weight_decay,
             mixup_alpha=args.mixup_alpha,
-            cutmix_alpha=args.cutmix_alpha,
             loss_type=args.loss_type,
             pos_weight_multiplier=args.pos_weight_mult,
             temperature_scaling=not args.no_temp_scaling,
@@ -3386,28 +2608,6 @@ def main() -> None:
             bootstrap_iterations=args.bootstrap,
             device_name=args.device,
             seed=args.seed,
-            use_sam=not args.no_sam,
-            use_swa=not args.no_swa,
-            swa_start_frac=args.swa_start,
-            use_weighted_sampler=not args.no_weighted_sampler,
-            accumulation_steps=args.accumulation_steps,
-            progressive_resize=args.progressive_resize,
-            tta_scales=args.tta_scales,
-            pretrained_backbone_path=backbone_path,
-        )
-    elif args.command == "kfold":
-        train_kfold(
-            manifest_path=args.manifest,
-            image_root=args.image_root,
-            output_dir=args.output_dir,
-            n_splits=args.n_splits,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            loss_type=args.loss_type,
-            use_sam=not args.no_sam,
-            use_swa=not args.no_swa,
-            device_name=args.device,
         )
     elif args.command == "evaluate":
         evaluate_checkpoint(
@@ -3419,7 +2619,6 @@ def main() -> None:
             bootstrap_iterations=args.bootstrap,
             device_name=args.device,
             seed=args.seed,
-            tta_scales=args.tta_scales,
         )
     elif args.command == "predict":
         predict_image(args.image, args.checkpoint, args.device)
@@ -3436,7 +2635,7 @@ def main() -> None:
                 width_per_image=args.width // 4,
             )
         elif args.image:
-            # tenta carregar checkpoint para GradCAM; se não existir, mostra só a imagem
+            
             if Path(args.checkpoint).exists():
                 model, ckpt, device = load_checkpoint_model(args.checkpoint, args.device)
                 image_size = int(ckpt["image_size"])

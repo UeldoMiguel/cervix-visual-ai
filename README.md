@@ -27,8 +27,6 @@ Pipeline de aprendizado profundo, em **arquivo único** (Python), para a
   Sens ≥ 0,80).
 - **Intervalos de confiança via bootstrap** (nível de caso).
 - **Explicabilidade Grad-CAM** (exemplares TP/TN/FP/FN e conjunto completo).
-- **Pré-treino de domínio opcional** (Intel & MobileODT) e **K-Fold** com
-  ensemble *(funções avançadas presentes no código-fonte)*.
 
 ---
 
@@ -59,8 +57,8 @@ python src/cervix_visual_ai.py prepare --zip "IARC EXAME VISUAL.zip"
 # 2. Treinar o modelo
 python src/cervix_visual_ai.py train
 
-# 3. Avaliar um checkpoint (com TTA multi-escala opcional)
-python src/cervix_visual_ai.py evaluate --tta-scales 320 384 456
+# 3. Avaliar um checkpoint salvo
+python src/cervix_visual_ai.py evaluate
 
 # 4. Inferência em uma imagem
 python src/cervix_visual_ai.py predict --image caminho/para/imagem.jpg
@@ -129,8 +127,9 @@ regenerados com os scripts em `docs/scripts/`.
 @misc{cervixvisualai,
   title  = {Cervix Visual AI: Pipeline de Aprendizado Profundo para
             Classificacao de Lesoes Cervicais em Imagens de IVA},
-  author = {[Nome do Autor]},
+  author = {Ueldo Miguel Plentz Rodrigues},
   year   = {2026},
+  school = {Universidade do Vale do Rio dos Sinos (UNISINOS)},
   note   = {Artefato de pesquisa experimental}
 }
 ```
