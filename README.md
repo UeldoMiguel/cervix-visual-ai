@@ -93,10 +93,9 @@ cervix-visual-ai/
 ├── src/
 │   └── cervix_visual_ai.py        # pipeline completo (arquivo único)
 └── docs/
-    ├── relatorio_sbc.docx         # relatório técnico (formato SBC)
-    ├── relatorio_sbc.pdf
+    ├── relatorio_sbc.pdf          # relatório técnico (formato SBC)
     ├── figures/                   # diagramas (processo, arquitetura, UML…)
-    └── scripts/                   # geradores dos diagramas e do relatório
+    └── scripts/                   # geradores dos diagramas
 ```
 
 ---
