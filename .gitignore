@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Dados (NÃO versionar imagens médicas nem o ZIP licenciado da IARC)
+data/
+*.zip
+*.xlsx
+
+# Saídas de treino / artefatos
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Saídas geradas (mantidas em docs/figures quando forem do repositório)
+*.log
+runs/
+wandb/
+
+# Sistema operacional / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporários
+*.tmp
+tempCodeRunnerFile.py
